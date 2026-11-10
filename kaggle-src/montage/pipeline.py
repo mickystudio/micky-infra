@@ -298,6 +298,107 @@ def run_pipeline(
 
 
 # ---------------------------------------------------------------------------
+# Spec-based entry point (for API / orchestration callers)
+# ---------------------------------------------------------------------------
+def run_pipeline_from_spec(input_spec: dict) -> dict:
+    """
+    Run the full montage pipeline from a JSON-serializable spec dict.
+
+    This is the orchestration-friendly entry point — it accepts a single
+    `input_spec` and returns `{output_url, output_meta}`, suitable for
+    use from a backend task queue or REST handler.
+
+    Args:
+        input_spec: dict with the following keys (all optional unless noted):
+            - file_url        str   (required) path/URL to the raw 1080p
+                                     30fps 9:16 video. If it's a URL, the
+                                     caller is expected to have already
+                                     downloaded it to a local path that
+                                     ffmpeg can read.
+            - output_dir      str   (required) where to drop outputs.
+            - caption         str   optional override caption text.
+            - caption_style   str   hormozi | minimal | arabic_bold
+            - language        str   ar | en
+            - audience        str   patients | colleagues
+            - background      str   one of: dental_office, blue_gradient,
+                                       white_studio, infographic_bg, dreamy_soft
+            - lut             str   one of: teal_orange, medical_clean,
+                                              warm_clinical
+            - platforms       list[str]  subset of the 5 supported platforms.
+            - skip_stages     set[str]   stage ids to skip.
+
+    Returns:
+        {
+            'output_url':   str,           # primary MP4 path (first platform)
+            'output_meta': {
+                'outputs':     [...],     # per-platform export list
+                'stats':       {...},
+                'transcript_path': str,
+                'captions_path':   str,
+            }
+        }
+    """
+    if not isinstance(input_spec, dict):
+        raise TypeError(f'input_spec must be a dict, got {type(input_spec)}')
+
+    file_url = input_spec.get('file_url') or input_spec.get('input_video_path')
+    if not file_url:
+        raise ValueError(
+            "input_spec must include 'file_url' "
+            "(or 'input_video_path') pointing to the source video."
+        )
+
+    # The output_dir is where outputs will be written. The downstream
+    # 'output_url' (returned to the caller) is the path of the final MP4,
+    # NOT a directory — so we accept only 'output_dir' here.
+    output_dir = input_spec.get('output_dir')
+    if not output_dir:
+        raise ValueError(
+            "input_spec must include 'output_dir' where outputs should be "
+            "written."
+        )
+
+    # Map spec keys → pipeline options dict
+    options: dict[str, Any] = {}
+    for spec_key, opt_key in (
+        ('caption_style', 'caption_style'),
+        ('language', 'language'),
+        ('audience', 'audience'),
+        ('background', 'background'),
+        ('lut', 'lut'),
+        ('platforms', 'platforms'),
+        ('skip_stages', 'skip_stages'),
+    ):
+        if spec_key in input_spec:
+            options[opt_key] = input_spec[spec_key]
+
+    # Optional: store caller-supplied caption text in options for downstream
+    # consumers (caption_generator currently synthesizes from Whisper, but
+    # the override text is preserved here for future use).
+    if input_spec.get('caption'):
+        options['caption_override'] = input_spec['caption']
+
+    result = run_pipeline(file_url, output_dir, options)
+
+    # Pick the first platform output as the primary `output_url`.
+    outputs = result.get('outputs', []) or []
+    primary_url = outputs[0]['video_path'] if outputs else (
+        os.path.join(output_dir, 'animated_video.mp4')
+    )
+
+    return {
+        'output_url': primary_url,
+        'output_meta': {
+            'outputs': outputs,
+            'stats': result.get('stats', {}),
+            'transcript_path': result.get('transcript_path'),
+            'captions_path': result.get('captions_path'),
+            'error': result.get('error'),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Whisper transcription (Stage 1)
 # ---------------------------------------------------------------------------
 def transcribe_video(video_path: str, language: str = 'ar') -> dict:
@@ -312,8 +413,16 @@ def transcribe_video(video_path: str, language: str = 'ar') -> dict:
         Whisper result dict with keys: 'text', 'segments' (each containing
         'words' list of {word, start, end}).
     """
-    import torch
-    import whisper
+    try:
+        import torch
+        import whisper
+    except ImportError as e:
+        raise RuntimeError(
+            "Whisper is required for transcription but is not installed. "
+            "On Kaggle, run: `!pip install -q openai-whisper` "
+            "(see montage_pipeline.ipynb Cell 2). "
+            f"Original error: {e}"
+        ) from e
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"   🔧 Loading Whisper large-v3 on {device}...")
@@ -357,8 +466,8 @@ def _probe_video_duration(video_path: str) -> float:
 # ---------------------------------------------------------------------------
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Micky Assistant Montage Pipeline')
-    parser.add_argument('--input', required=True, help='Path to raw 1080p 30fps video')
-    parser.add_argument('--output', required=True, help='Output directory')
+    parser.add_argument('--input', help='Path to raw 1080p 30fps video')
+    parser.add_argument('--output', help='Output directory')
     parser.add_argument(
         '--options', type=str, default='{}',
         help='JSON string with pipeline options',
@@ -368,7 +477,25 @@ if __name__ == '__main__':
         help='Comma-separated stage ids to skip '
              '(transcribe,takes,audio,background,color,captions,animation,export)',
     )
+    parser.add_argument(
+        '--spec', type=str, default=None,
+        help='Path to a JSON spec file (alternative to --input/--output). '
+             'Uses the run_pipeline_from_spec(input_spec) entry point.',
+    )
     args = parser.parse_args()
+
+    # Mode A: spec-based entry point (preferred for orchestration callers)
+    if args.spec:
+        with open(args.spec, 'r', encoding='utf-8') as f:
+            spec = json.load(f)
+        result = run_pipeline_from_spec(spec)
+        print("\n=== PIPELINE RESULT (from spec) ===")
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        sys.exit(0)
+
+    # Mode B: classic positional CLI
+    if not args.input or not args.output:
+        parser.error('either --spec <spec.json> or both --input and --output are required')
 
     options: dict = json.loads(args.options)
     if args.skip:
