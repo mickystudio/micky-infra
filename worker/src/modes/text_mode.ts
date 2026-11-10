@@ -36,10 +36,13 @@ import {
   type LLMResponse,
 } from '../integrations/llama_client';
 import {
-  formatSearchForPrompt,
+  formatSearchContext,
+  formatSourceFootnotes,
   needsWebSearch,
   webSearch,
 } from '../integrations/web_search';
+import { compilePrompt } from '../core/prompt_compiler';
+import { arabicRatio } from '../utils/tokens';
 import { logger } from '../utils/logger';
 
 // ============ Types ============
@@ -496,6 +499,89 @@ export async function handleTextCommand(env: Env, chatId: number): Promise<void>
   logger.info('text_mode', '/text command handled', { chatId });
 }
 
+// ============ Prompt compiler integration helpers ============
+
+/**
+ * Detect the user's primary language from their message text.
+ *
+ * Used to pick the appropriate language directive in the compiled prompt
+ * (Arabic by default, English if the message is predominantly Latin script).
+ *
+ * Threshold: if >20% of non-whitespace characters are Arabic, treat as Arabic.
+ * This mirrors the heuristic in `utils/tokens.ts::estimateTokens`.
+ */
+function detectLanguage(text: string): 'ar' | 'en' {
+  return arabicRatio(text) > 0.2 ? 'ar' : 'en';
+}
+
+/**
+ * Remove the just-saved user message from the compiled messages' history portion.
+ *
+ * `compilePrompt`'s contextualize layer (Layer 2) fetches the last 10 messages
+ * from D1, which now includes the just-saved user message. Its constrain layer
+ * (Layer 4) then appends the compressed version of the same message as the
+ * final user message. Without this filter the LLM would see the user's request
+ * twice (once raw in history, once compressed at the end).
+ *
+ * We find the most recent 'user' message in `messages` (excluding the final
+ * user message, which is the compressed version) whose content matches the
+ * raw `justSavedContent`, and remove it. The final user message is preserved
+ * untouched.
+ *
+ * Content-match is reliable because `saveMessage` stores `content` as-is (no
+ * truncation/normalization) and `contextualize` fetches it raw.
+ */
+function dedupeJustSavedUserMessage(
+  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+  justSavedContent: string,
+): Array<{ role: 'system' | 'user' | 'assistant'; content: string }> {
+  if (!justSavedContent || messages.length < 2) return messages;
+  const out = messages.slice(0, -1); // all except the final user message
+  for (let i = out.length - 1; i >= 0; i--) {
+    if (out[i].role === 'user' && out[i].content === justSavedContent) {
+      out.splice(i, 1);
+      break; // only remove the most recent match (the just-saved one)
+    }
+  }
+  out.push(messages[messages.length - 1]); // re-add the final user message
+  return out;
+}
+
+/**
+ * Legacy message builder — used when `compilePrompt` throws OR when the caller
+ * supplies a `systemPromptOverride` (in which case the caller wants full
+ * control over the system prompt and the 4-layer compiler is bypassed).
+ *
+ * Mirrors the original `handleTextMessage` logic: manual history load via
+ * `loadChatHistory` + DEFAULT_SYSTEM_PROMPT (or override) + final user message
+ * with optional web search context.
+ */
+async function buildLegacyMessages(
+  env: Env,
+  chatIdStr: string,
+  userMsgId: string,
+  text: string,
+  searchContext: string,
+  config?: TextModeConfig,
+): Promise<ChatMessage[]> {
+  const history = await loadChatHistory(env, chatIdStr, HISTORY_LIMIT);
+  const systemPrompt = config?.systemPromptOverride ?? DEFAULT_SYSTEM_PROMPT;
+  const messages: ChatMessage[] = [{ role: 'system', content: systemPrompt }];
+
+  for (const m of history) {
+    // Skip the just-saved user message — it'll be re-appended below with
+    // the search context attached so the LLM sees it exactly once.
+    if (m.id === userMsgId) continue;
+    const role = toChatRole(m.role);
+    if (!role) continue;
+    messages.push({ role, content: m.content });
+  }
+
+  const finalUserText = searchContext ? `${text}\n\n---\n${searchContext}` : text;
+  messages.push({ role: 'user', content: finalUserText });
+  return messages;
+}
+
 // ============ Public: handleTextMessage ============
 
 /**
@@ -504,14 +590,26 @@ export async function handleTextCommand(env: Env, chatId: number): Promise<void>
  * Pipeline:
  *   1. Save the user message to D1 (`messages` table, role=user).
  *   2. Detect time-sensitivity (`needsWebSearch`); if true, run a DuckDuckGo
- *      query and format the results into a Markdown block.
- *   3. Build the LLM messages array: [system, ...history, user_with_search].
+ *      query (cached 1h in PROMPT_CACHE KV, with Bing fallback) and format
+ *      the results into a Markdown block.
+ *   3. Build the LLM messages array via the 4-layer prompt compiler
+ *      (compress → contextualize → route → constrain). The compiler picks a
+ *      golden template based on the detected message type:
+ *        - question              → question.yaml
+ *        - code_request          → code_request.yaml
+ *        - analysis              → analysis.yaml
+ *        - dental_medical        → dental_educational.yaml (default)
+ *          └─ +clinical hint     → dental_clinical.yaml
+ *      Falls back to the legacy manual-history path if the compiler throws
+ *      or if the caller supplied a `systemPromptOverride`.
  *   4. Send a placeholder "🤔 ..." message — this is the message we'll edit
  *      as tokens stream in.
  *   5. Stream the LLM response, editing Telegram every ~1s.
  *   6. On stream failure: fall back to single-shot `callLLM`.
- *   7. Final edit with the full text + inline keyboard.
+ *   7. Append source footnotes to the final reply (after streaming, before
+ *      the final edit) so the user sees where the fresh info came from.
  *   8. Save the assistant message (with `model_used` and `sources`).
+ *   9. Final edit with the full text + inline keyboard (and overflow split).
  */
 export async function handleTextMessage(
   env: Env,
@@ -525,7 +623,9 @@ export async function handleTextMessage(
     length: text.length,
   });
 
-  // 1. Save user message.
+  // 1. Save the user message first (audit trail). `compilePrompt`'s
+  //    contextualize layer will fetch this from D1, so we dedupe it from
+  //    the compiled history below to avoid sending the request twice.
   const userMsgId = crypto.randomUUID();
   await saveMessage(env, {
     id: userMsgId,
@@ -537,14 +637,16 @@ export async function handleTextMessage(
   // 2. Web search (if needed).
   let searchContext = '';
   let sources: string[] = [];
+  let searchResponse: Awaited<ReturnType<typeof webSearch>> | null = null;
   if (needsWebSearch(text)) {
     try {
       logger.info('text_mode', 'performing web search', { query: text.slice(0, 80) });
-      const searchResponse = await webSearch(text, 5);
-      searchContext = formatSearchForPrompt(searchResponse);
+      searchResponse = await webSearch(env, text, 5);
+      searchContext = formatSearchContext(searchResponse);
       sources = searchResponse.results.map((r) => r.url);
       logger.info('text_mode', 'web search done', {
         count: sources.length,
+        cached: searchResponse.cached_at,
       });
     } catch (err) {
       // Graceful fallback: continue without search context.
@@ -554,25 +656,70 @@ export async function handleTextMessage(
     }
   }
 
-  // 3. Load chat history (excluding the just-saved user message — we'll
-  //    re-append it with the search context below).
-  const history = await loadChatHistory(env, chatIdStr, HISTORY_LIMIT);
+  // 3. Build the LLM messages array.
+  //    Primary path: 4-layer prompt compiler (compress → contextualize →
+  //    route → constrain). Picks a golden template based on message type
+  //    (question / code_request / analysis / dental_educational /
+  //    dental_clinical) and assembles system prompt + history + memory +
+  //    output-format / language / safety constraints.
+  //    Fallback path: legacy manual history + DEFAULT_SYSTEM_PROMPT — used
+  //    when the compiler throws OR when the caller supplied a
+  //    `systemPromptOverride` (caller wants full control of the system prompt).
+  let messages: ChatMessage[];
 
-  // 4. Build the LLM messages array.
-  const systemPrompt = config?.systemPromptOverride ?? DEFAULT_SYSTEM_PROMPT;
-  const messages: ChatMessage[] = [{ role: 'system', content: systemPrompt }];
+  if (config?.systemPromptOverride) {
+    // Caller wants full control — bypass the compiler entirely.
+    messages = await buildLegacyMessages(
+      env,
+      chatIdStr,
+      userMsgId,
+      text,
+      searchContext,
+      config,
+    );
+  } else {
+    try {
+      const compiled = await compilePrompt(env, chatIdStr, text, {
+        language: detectLanguage(text),
+      });
 
-  for (const m of history) {
-    if (m.id === userMsgId) continue;
-    const role = toChatRole(m.role);
-    if (!role) continue;
-    messages.push({ role, content: m.content });
+      // Dedupe the just-saved user message from the compiled history.
+      // `compilePrompt`'s contextualize layer fetched it from D1, and its
+      // constrain layer also appended the compressed version as the final
+      // user message — without this filter the LLM would see the request
+      // twice.
+      messages = dedupeJustSavedUserMessage(compiled.messages, text).map(
+        (m): ChatMessage => ({ role: m.role, content: m.content }),
+      );
+
+      // Append web search context to the final user message so the LLM
+      // sees fresh sources inline with the request.
+      if (searchContext && messages.length > 0) {
+        const last = messages[messages.length - 1];
+        last.content = `${last.content}\n\n---\n${searchContext}`;
+      }
+
+      logger.info('text_mode', 'compiled prompt via 4-layer compiler', {
+        template: compiled.metadata.template_used,
+        request_type: compiled.metadata.request_type,
+        cached: compiled.metadata.cached,
+        tokens_estimated: compiled.metadata.tokens_estimated.total,
+        compile_ms: compiled.metadata.compile_time_ms,
+      });
+    } catch (err) {
+      logger.warn('text_mode', 'compilePrompt failed; using legacy path', {
+        error: String(err),
+      });
+      messages = await buildLegacyMessages(
+        env,
+        chatIdStr,
+        userMsgId,
+        text,
+        searchContext,
+        config,
+      );
+    }
   }
-
-  const finalUserText = searchContext
-    ? `${text}\n\n---\n${searchContext}`
-    : text;
-  messages.push({ role: 'user', content: finalUserText });
 
   // 5. Send placeholder message.
   const placeholderId = await sendTelegramMessage(env, chatId, '🤔 ...');
@@ -616,6 +763,17 @@ export async function handleTextMessage(
         error: String(err2),
       });
       fullText = '⚠️ حدث خطأ أثناء توليد الرد. حاول مرة أخرى لاحقًا.';
+    }
+  }
+
+  // 7.5. Append sources as footnotes after the LLM reply, so the user sees
+  //      where the fresh information came from directly in the chat — not
+  //      only behind the [🌐 تتبع المصادر] inline button. The footnotes are
+  //      appended after streaming completes to avoid flicker mid-stream.
+  if (searchResponse && searchResponse.total_found > 0) {
+    const footnotes = formatSourceFootnotes(searchResponse);
+    if (footnotes) {
+      fullText = `${fullText}${footnotes}`;
     }
   }
 
