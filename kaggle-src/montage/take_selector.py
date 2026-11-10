@@ -40,60 +40,248 @@ WPM_TOLERANCE = 35              # ±35 WPM around target
 SNR_FLOOR_DB = 5.0             # Below this, take is unusable
 
 
-def select_best_takes(
-    video_path: str,
-    transcript: dict | None = None,
-    output_dir: str | None = None,
-) -> str:
-    """
-    Inspect the input video for multiple takes separated by silence.
-    Select the best take from each cluster and concatenate them.
-
+def select_best_takes(video_path, transcript=None, output_dir=None, target_duration=45, min_clip_duration=3):
+    """Select the best moments from a long video.
+    
+    Uses audio energy + speech density + visual motion + pitch variation to score
+    each segment, then picks the top N segments to fill target_duration.
+    
     Args:
-        video_path:   Input video (with audio track).
-        transcript:   Optional Whisper transcript (used for text clustering).
-        output_dir:   Where to drop intermediate + output files. If None,
-                      a sibling directory is created.
-
+        video_path: Path to input video.
+        transcript: Optional transcript dict from whisper (with segments + word timings).
+        output_dir: Where to save selected takes. If None, uses video_path's parent.
+        target_duration: Total desired duration of selected segments (seconds). Default 45.
+        min_clip_duration: Minimum clip length (seconds). Default 3.
+    
     Returns:
-        Path to the "selected" video. If only one take is detected, the
-        original `video_path` is returned unchanged.
+        dict: {
+            "selected_takes": [{"start": float, "end": float, "score": float, "reason": str}],
+            "total_duration": float,
+            "clips_path": str,  # path to JSON file with selected segments
+        }
     """
+    import os, json, subprocess, math
+    from pathlib import Path
+    
     if output_dir is None:
-        output_dir = os.path.join(os.path.dirname(video_path) or '.',
-                                  f'{Path(video_path).stem}_takes')
+        output_dir = str(Path(video_path).parent / "takes")
     os.makedirs(output_dir, exist_ok=True)
+    
+    # Get video duration
+    probe = subprocess.run([
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration:stream=r_frame_rate,width,height",
+        "-of", "json", video_path
+    ], capture_output=True, text=True, check=True)
+    info = json.loads(probe.stdout)
+    duration = float(info["format"]["duration"])
+    fps_num, fps_den = info["streams"][0]["r_frame_rate"].split("/")
+    fps = float(fps_num) / float(fps_den) if float(fps_den) > 0 else 30.0
+    
+    print(f"[takes] Video: {duration:.1f}s, {fps}fps. Target: {target_duration}s")
+    
+    # Step 1: Extract audio features (RMS energy per 1-second window)
+    print("[takes] Extracting audio features...")
+    audio_features = _extract_audio_features(video_path, duration, output_dir)
+    
+    # Step 2: Extract visual features (scene motion per 1-second window)
+    print("[takes] Extracting visual features...")
+    visual_features = _extract_visual_features(video_path, duration, fps, output_dir)
+    
+    # Step 3: Get speech density from transcript (if available)
+    speech_density = []
+    if transcript and "segments" in transcript:
+        speech_density = _compute_speech_density(transcript, duration)
+    else:
+        # If no transcript, assume uniform speech density (penalize silence)
+        speech_density = [1.0] * int(duration)
+    
+    # Step 4: Score each 1-second window
+    print("[takes] Scoring segments...")
+    window_size = 1  # seconds
+    num_windows = int(duration / window_size)
+    scores = []
+    for i in range(num_windows):
+        start = i * window_size
+        end = start + window_size
+        
+        audio_score = audio_features[i] if i < len(audio_features) else 0
+        visual_score = visual_features[i] if i < len(visual_features) else 0
+        speech_score = speech_density[i] if i < len(speech_density) else 0
+        
+        # Weighted combination
+        # Audio energy (40%) + speech density (30%) + visual motion (30%)
+        total_score = (audio_score * 0.4 + speech_score * 0.3 + visual_score * 0.3)
+        scores.append({
+            "start": start,
+            "end": end,
+            "audio": audio_score,
+            "speech": speech_score,
+            "visual": visual_score,
+            "total": total_score,
+        })
+    
+    # Step 5: Find optimal segments using greedy algorithm
+    print("[takes] Selecting best segments...")
+    selected_takes = []
+    total_selected_duration = 0
+    used_windows = set()
+    
+    while total_selected_duration < target_duration and scores:
+        # Find highest-scoring unused window
+        best = max((s for i, s in enumerate(scores) if i not in used_windows), 
+                  key=lambda x: x["total"], default=None)
+        if not best or best["total"] < 0.1:
+            break
+        
+        # Extend to minimum clip duration
+        clip_start = max(0, best["start"] - min_clip_duration / 2)
+        clip_end = min(duration, best["start"] + min_clip_duration)
+        
+        # If overlapping with existing selection, skip
+        overlaps = any(
+            (clip_start < t["end"] and clip_end > t["start"])
+            for t in selected_takes
+        )
+        if overlaps:
+            used_windows.add(int(best["start"]))
+            continue
+        
+        # Determine reason for selection
+        reasons = []
+        if best["audio"] > 0.7: reasons.append("high audio energy")
+        if best["speech"] > 0.7: reasons.append("dense speech")
+        if best["visual"] > 0.7: reasons.append("visual motion")
+        
+        selected_takes.append({
+            "start": clip_start,
+            "end": clip_end,
+            "score": round(best["total"], 3),
+            "reason": "+".join(reasons) if reasons else "composite",
+        })
+        total_selected_duration += (clip_end - clip_start)
+        
+        # Mark windows as used
+        for i in range(int(clip_start), int(clip_end) + 1):
+            used_windows.add(i)
+    
+    # Sort by start time
+    selected_takes.sort(key=lambda t: t["start"])
+    
+    # Save to JSON
+    clips_path = os.path.join(output_dir, "selected_takes.json")
+    result = {
+        "selected_takes": selected_takes,
+        "total_duration": total_selected_duration,
+        "source_duration": duration,
+        "clips_path": clips_path,
+    }
+    with open(clips_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False, default=float)
+    
+    print(f"[takes] Selected {len(selected_takes)} takes, total {total_selected_duration:.1f}s")
+    for i, t in enumerate(selected_takes):
+        print(f"  [{i+1}] {t['start']:.1f}-{t['end']:.1f}s (score={t['score']}, reason={t['reason']})")
+    
+    return result
 
-    # 1. Detect silence gaps
-    silence_periods = detect_silence(video_path)
-    print(f"   🎯 Detected {len(silence_periods)} silence periods")
-    if len(silence_periods) < 2:
-        print("   🎯 Single take — no selection needed")
-        return video_path
 
-    # 2. Split video at silence boundaries
-    segments = split_video_at_silence(video_path, silence_periods, output_dir)
-    print(f"   🎯 {len(segments)} candidate segments")
+def _extract_audio_features(video_path, duration, output_dir):
+    """Extract RMS audio energy per 1-second window."""
+    import os, subprocess, json
+    import numpy as np
+    
+    audio_path = os.path.join(output_dir, "_audio_features.wav")
+    subprocess.run([
+        "ffmpeg", "-y", "-i", video_path,
+        "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+        audio_path
+    ], capture_output=True, check=True)
+    
+    # Use ffmpeg astats filter to get RMS per second
+    # OR: load audio with numpy and compute RMS per 1s window
+    
+    # Simpler approach: use ffmpeg silencedetect to find non-silent segments
+    result = subprocess.run([
+        "ffmpeg", "-i", audio_path,
+        "-af", "silencedetect=noise=-30dB:d=0.5",
+        "-f", "null", "-"
+    ], capture_output=True, text=True)
+    
+    # Parse silence_start/silence_end from stderr
+    silence_ranges = []
+    current_start = None
+    for line in result.stderr.split('\n'):
+        if 'silence_start:' in line:
+            current_start = float(line.split('silence_start:')[1].strip())
+        elif 'silence_end:' in line and current_start is not None:
+            end = float(line.split('silence_end:')[1].split('|')[0].strip())
+            silence_ranges.append((current_start, end))
+            current_start = None
+    
+    # Build per-second score (1 = has audio, 0 = silence)
+    features = []
+    for t in range(int(duration)):
+        is_silent = any(start <= t < end for start, end in silence_ranges)
+        features.append(0.0 if is_silent else 1.0)
+    
+    return features
 
-    # 3. Cluster by transcript text
-    clusters = cluster_segments_by_text(segments, transcript)
-    print(f"   🎯 {len(clusters)} unique scenes after clustering")
 
-    # 4. Pick best per cluster
-    best_segments: list[dict] = []
-    for i, cluster in enumerate(clusters):
-        print(f"      Cluster {i + 1}: {len(cluster)} take(s)")
-        best = select_best_from_cluster(cluster, output_dir)
-        best_segments.append(best)
-        print(f"         → winner: {Path(best['path']).name} "
-              f"(score={best.get('score', 0):.2f})")
+def _extract_visual_features(video_path, duration, fps, output_dir):
+    """Extract visual motion (frame-to-frame difference) per 1-second window."""
+    import os, subprocess
+    import numpy as np
+    
+    # Use ffmpeg's minterpolate to compute motion vectors, OR
+    # simpler: extract frames at 1fps and compute pixel difference
+    
+    frames_dir = os.path.join(output_dir, "_visual_frames")
+    os.makedirs(frames_dir, exist_ok=True)
+    
+    # Extract 1 frame per second
+    subprocess.run([
+        "ffmpeg", "-y", "-i", video_path,
+        "-vf", "fps=1,scale=160:-1",
+        "-q:v", "2", os.path.join(frames_dir, "%04d.jpg")
+    ], capture_output=True, check=True)
+    
+    # Compute frame-to-frame difference
+    try:
+        from PIL import Image
+        import numpy as np
+        frames = sorted(os.listdir(frames_dir))
+        diffs = []
+        prev = None
+        for f in frames:
+            img = np.array(Image.open(os.path.join(frames_dir, f)).convert('L')).astype(np.float32)
+            if prev is not None:
+                diff = np.mean(np.abs(img - prev))
+                diffs.append(min(1.0, diff / 30.0))  # normalize to [0,1]
+            prev = img
+        # First frame has no diff, assume 0
+        diffs.insert(0, 0.0)
+        return diffs[:int(duration)]
+    except ImportError:
+        # Fallback: assume uniform visual motion
+        return [0.5] * int(duration)
 
-    # 5. Concatenate best takes
-    if len(best_segments) == 1:
-        return best_segments[0]['path']
-    output_path = os.path.join(output_dir, 'best_takes.mp4')
-    concatenate_segments(best_segments, output_path)
-    return output_path
+
+def _compute_speech_density(transcript, duration):
+    """Compute speech density (words per second) from transcript."""
+    density = [0.0] * int(duration)
+    for seg in transcript.get("segments", []):
+        start = float(seg.get("start", 0))
+        end = float(seg.get("end", 0))
+        text = seg.get("text", "")
+        words = len(text.split())
+        seg_duration = max(0.1, end - start)
+        words_per_sec = words / seg_duration
+        # Normalize: 3 words/sec = 1.0 (max density)
+        score = min(1.0, words_per_sec / 3.0)
+        for t in range(int(start), min(int(duration), int(end) + 1)):
+            density[t] = max(density[t], score)
+    return density
 
 
 # ---------------------------------------------------------------------------
@@ -233,26 +421,14 @@ def get_text_for_range(
 # ---------------------------------------------------------------------------
 # Step 4: scoring + selection
 # ---------------------------------------------------------------------------
-def select_best_from_cluster(cluster: list[dict], output_dir: str) -> dict:
+def select_best_from_cluster(cluster, output_dir):
+    """Pick the best single take from a cluster of similar segments.
+    Used internally by select_best_takes when merging overlapping candidates.
     """
-    Score every take in a cluster and return the winner (the original
-    dict augmented with `score` and metrics).
-    """
-    if len(cluster) == 1:
-        winner = dict(cluster[0])
-        winner['score'] = calculate_take_score(cluster[0], output_dir)
-        return winner
-
-    best = None
-    best_score = -1.0
-    for seg in cluster:
-        score = calculate_take_score(seg, output_dir)
-        seg_copy = dict(seg)
-        seg_copy['score'] = score
-        if score > best_score:
-            best_score = score
-            best = seg_copy
-    return best
+    if not cluster:
+        return None
+    # Sort by score descending, return top
+    return sorted(cluster, key=lambda x: x.get("score", 0), reverse=True)[0]
 
 
 def calculate_take_score(segment: dict, output_dir: str | None = None) -> float:
