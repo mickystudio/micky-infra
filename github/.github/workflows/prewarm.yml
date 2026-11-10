@@ -1,0 +1,76 @@
+# Micky Assistant Unlimited — Prewarm Cache
+# GitHub Actions cache entries expire after 7 days of inactivity.
+# This workflow runs every 4 hours to keep the GGUF model alive in cache,
+# so the main runner benefits from an instant (<5s) cache hit instead of
+# re-downloading ~9GB on every invocation.
+#
+# Strategy:
+#   - Restore the cache (read). This resets the 7-day TTL.
+#   - If cache hit: do nothing (already warm). The restore itself is the "touch".
+#   - If cache miss: download the GGUF from Releases, assemble it, save to cache.
+
+name: Prewarm Cache
+
+on:
+  schedule:
+    - cron: '0 */4 * * *'   # every 4 hours, UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prewarm
+  cancel-in-progress: false
+
+jobs:
+  prewarm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      MODEL_VERSION: v1
+      MODEL_NAME: qwen2.5-coder-14b-q4_k_m
+      MODEL_CACHE_KEY: model-14b-v1
+      MODEL_PATH: models/qwen2.5-coder-14b-q4_k_m.gguf
+    steps:
+      - name: Checkout micky-infra
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Restore cache (TTL refresh)
+        id: model-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.MODEL_PATH }}
+          key: ${{ env.MODEL_CACHE_KEY }}
+
+      - name: Touch cache (already warm)
+        if: steps.model-cache.outputs.cache-hit == 'true'
+        run: |
+          echo "::notice::Cache key $MODEL_CACHE_KEY is warm — TTL reset by restore."
+          ls -lh "$MODEL_PATH" || true
+
+      - name: Assemble & save (cold cache)
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$MODEL_PATH")"
+          bash scripts/assemble_model.sh "$MODEL_VERSION"
+          mv "./${MODEL_NAME}.gguf" "$MODEL_PATH"
+          ls -lh "$MODEL_PATH"
+
+      - name: Save cache
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.MODEL_PATH }}
+          key: ${{ env.MODEL_CACHE_KEY }}
+
+      - name: Summary
+        run: |
+          echo "### Prewarm Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Cache key: \`$MODEL_CACHE_KEY\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Status: ${{ steps.model-cache.outputs.cache-hit == 'true' && 'warm (TTL reset)' || 'cold (rebuilt)' }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Time: $(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_STEP_SUMMARY"
