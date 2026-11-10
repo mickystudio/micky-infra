@@ -31,16 +31,44 @@ export interface Memory {
   lastUsed: number;
 }
 
+/**
+ * Category used by the newer `rememberFact` / `recallFacts` API (tasks A13).
+ * Stored in the same `memory_type` column the legacy API uses, so the two
+ * APIs are fully interoperable.
+ */
+export type MemoryCategory = 'preference' | 'fact' | 'instruction' | 'context';
+
+/**
+ * Lightweight memory record returned by the newer recall API (task A13).
+ * Distinct from the richer `Memory` interface used by the legacy
+ * pattern-extraction API on purpose: prompt-injection callers usually only
+ * need the category + content.
+ */
+export interface MemoryFact {
+  id: string;
+  category: string;
+  content: string;
+  confidence: number;
+  created_at: number;
+}
+
 /** Row shape returned by D1 for `project_memory`. */
 interface MemoryRow {
   id: string;
-  project_id: string;
-  memory_type: string;
+  project_id: string | null;
+  memory_type: string | null;
+  user_id: number | null;
   content: string;
   confidence: number;
   times_reinforced: number;
   created_at: number;
   last_used: number;
+  expires_at: number | null;
+}
+
+/** Shape of a `users` row (for chat_id → user_id lookup). */
+interface UserRow {
+  id: number;
 }
 
 /** Shape of a `messages` row (for conversation extraction). */
@@ -81,6 +109,23 @@ const MAX_RELEVANT_MEMORIES = 5;
 /** Pool size before keyword filtering (fetch more, filter to top N). */
 const RELEVANCE_POOL_SIZE = 20;
 
+// ============ KV cache constants (newer rememberFact / recallFacts API) ============
+
+/** Default TTL for memory cache entries when no ttlSeconds is supplied. */
+const DEFAULT_MEMORY_CACHE_TTL_SECONDS = 60 * 60; // 1 hour
+
+/** Maximum number of facts returned by `recallFacts` when caller passes no limit. */
+const DEFAULT_RECALL_LIMIT = 10;
+
+/** Hard ceiling on `limit` to avoid pathological queries. */
+const MAX_RECALL_LIMIT = 100;
+
+/** Prefix used for individual-fact KV cache entries. */
+const KV_FACT_PREFIX = 'memfact:';
+
+/** Prefix used for recall-list KV cache entries. */
+const KV_LIST_PREFIX = 'memlist:';
+
 // ============ Helpers ============
 
 /** Current Unix time in seconds (matches D1 `unixepoch()`). */
@@ -116,7 +161,7 @@ function coerceMemoryType(raw: unknown): Memory['type'] {
 function rowToMemory(row: MemoryRow): Memory {
   return {
     id: row.id,
-    projectId: row.project_id,
+    projectId: row.project_id ?? '',
     type: coerceMemoryType(row.memory_type),
     content: row.content,
     confidence: Number(row.confidence ?? 0.5),
@@ -124,6 +169,30 @@ function rowToMemory(row: MemoryRow): Memory {
     createdAt: Number(row.created_at ?? 0),
     lastUsed: Number(row.last_used ?? 0),
   };
+}
+
+/** Map a D1 row to the lightweight MemoryFact interface (newer API). */
+function rowToMemoryFact(row: MemoryRow): MemoryFact {
+  return {
+    id: row.id,
+    category: row.memory_type ?? 'fact',
+    content: row.content,
+    confidence: Number(row.confidence ?? 0.5),
+    created_at: Number(row.created_at ?? 0),
+  };
+}
+
+/** Coerce an arbitrary DB value into `MemoryCategory`. */
+function coerceMemoryCategory(raw: unknown): MemoryCategory {
+  switch (String(raw)) {
+    case 'preference':
+    case 'fact':
+    case 'instruction':
+    case 'context':
+      return raw as MemoryCategory;
+    default:
+      return 'fact';
+  }
 }
 
 /**
@@ -464,4 +533,412 @@ export function formatMemoriesForPrompt(memories: Memory[]): string {
   });
 
   return [header, ...lines].join('\n');
+}
+
+// ============================================================================
+// ===========  NEWER API (task A13): remember / recall / forget  =============
+// ============================================================================
+//
+// Designed for ad-hoc, application-driven memory storage:
+//   - "user prefers Arabic responses"                → preference
+//   - "project X uses dental terminology"            → context
+//   - "do not run code without confirmation"         → instruction
+//
+// Persists to the same `project_memory` table the legacy pattern-extraction
+// API uses (so the two are interoperable), and additionally caches reads in
+// the PROMPT_CACHE KV namespace.
+
+/**
+ * Look up the numeric `users.id` for a Telegram `chat_id`.
+ * Returns `null` if the user has not authenticated with the bot yet.
+ *
+ * يحوّل chat_id إلى user_id داخل جدول users
+ */
+async function resolveUserId(env: Env, chatId: number): Promise<number | null> {
+  try {
+    const row = await env.DB.prepare(
+      'SELECT id FROM users WHERE chat_id = ? LIMIT 1',
+    )
+      .bind(chatId)
+      .first<UserRow>();
+    return row?.id ?? null;
+  } catch (err) {
+    console.error('[memory_engine] resolveUserId failed:', err);
+    return null;
+  }
+}
+
+/**
+ * Resolve `project_id` for a memory write.
+ * Priority: explicit `projectId` argument → most recent project owned by the
+ * Telegram user. Returns `null` when neither is available (the memory will
+ * still be stored as user-scoped only).
+ *
+ * يحدّد project_id للذاكرة: إمّا مُمرّر صراحةً أو آخر مشروع للمستخدم
+ */
+async function resolveProjectIdForMemory(
+  env: Env,
+  chatId: number,
+  projectId?: string,
+): Promise<string | null> {
+  if (projectId) return projectId;
+
+  const userId = await resolveUserId(env, chatId);
+  if (!userId) return null;
+
+  try {
+    const row = await env.DB.prepare(
+      'SELECT id FROM projects WHERE user_id = ? ORDER BY updated_at DESC LIMIT 1',
+    )
+      .bind(userId)
+      .first<{ id: string }>();
+    return row?.id ?? null;
+  } catch (err) {
+    console.error('[memory_engine] resolveProjectIdForMemory failed:', err);
+    return null;
+  }
+}
+
+/**
+ * Build the KV list-cache key used by `recallFacts`.
+ *
+ * ```
+ *   memlist:chat:1235548782:cat:preference:proj:prj_abc:lim:10
+ * ```
+ *
+ * Any filter that is `undefined` is encoded as `all` so the same query hits
+ * the same cache slot.
+ */
+function makeListCacheKey(
+  chatId: number,
+  category: MemoryCategory | undefined,
+  projectId: string | null | undefined,
+  limit: number,
+): string {
+  return (
+    `${KV_LIST_PREFIX}chat:${chatId}` +
+    `:cat:${category ?? 'all'}` +
+    `:proj:${projectId ?? 'all'}` +
+    `:lim:${limit}`
+  );
+}
+
+/**
+ * Store a memory fact for a user/project.
+ *
+ * Examples:
+ *   - rememberFact(env, 123, 'user prefers Arabic responses', 'preference')
+ *   - rememberFact(env, 123, 'project X uses dental terminology', 'context', 'prj_x')
+ *
+ * Behaviour:
+ *   - Resolves `project_id` (explicit arg → user's latest project → null).
+ *   - Resolves `user_id` from `chat_id` via the `users` table.
+ *   - Persists to D1 `project_memory` using `memory_type = category`.
+ *   - Writes a per-fact KV cache entry (PROMPT_CACHE, TTL = ttlSeconds or 1h).
+ *   - Best-effort invalidates the recallFacts list cache for the same scope.
+ *
+ * @returns The new memory ID (prefix `mem_`), or empty string on failure.
+ */
+export async function rememberFact(
+  env: Env,
+  chatId: number,
+  fact: string,
+  category: MemoryCategory = 'fact',
+  projectId?: string,
+  confidence: number = 1.0,
+  ttlSeconds?: number,
+): Promise<string> {
+  const cleanFact = (fact ?? '').trim();
+  if (!cleanFact) return '';
+
+  const safeCategory = coerceMemoryCategory(category);
+  const safeConfidence = Math.min(
+    MAX_CONFIDENCE,
+    Math.max(0, Number(confidence) || 0),
+  );
+
+  // 1) Resolve scoping columns
+  const userId = await resolveUserId(env, chatId);
+  const resolvedProjectId = await resolveProjectIdForMemory(env, chatId, projectId);
+
+  // 2) Compute expires_at if a TTL was supplied
+  const ts = nowSeconds();
+  const expiresAt =
+    typeof ttlSeconds === 'number' && ttlSeconds > 0 ? ts + Math.floor(ttlSeconds) : null;
+
+  // 3) Insert into D1
+  const id = generateId('mem_');
+  try {
+    await env.DB.prepare(
+      `INSERT INTO project_memory
+         (id, project_id, user_id, memory_type, content, confidence,
+          times_reinforced, created_at, last_used, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        id,
+        resolvedProjectId,
+        userId,
+        safeCategory,
+        cleanFact,
+        safeConfidence,
+        1,
+        ts,
+        ts,
+        expiresAt,
+      )
+      .run();
+  } catch (err) {
+    console.error('[memory_engine] rememberFact insert failed:', err);
+    return '';
+  }
+
+  // 4) Write per-fact KV cache (best-effort, non-blocking failure)
+  const factRecord: MemoryFact = {
+    id,
+    category: safeCategory,
+    content: cleanFact,
+    confidence: safeConfidence,
+    created_at: ts,
+  };
+  const cacheTtl =
+    typeof ttlSeconds === 'number' && ttlSeconds > 0
+      ? Math.min(ttlSeconds, DEFAULT_MEMORY_CACHE_TTL_SECONDS * 24) // cap at 24h
+      : DEFAULT_MEMORY_CACHE_TTL_SECONDS;
+
+  try {
+    await env.PROMPT_CACHE.put(
+      `${KV_FACT_PREFIX}${id}`,
+      JSON.stringify(factRecord),
+      { expirationTtl: cacheTtl },
+    );
+  } catch (err) {
+    console.warn('[memory_engine] rememberFact KV put failed:', err);
+  }
+
+  // 5) Best-effort invalidate the recall list cache for the same scope.
+  // We can't enumerate KV keys, so we delete the most common slot patterns.
+  const invalidateSlots: MemoryCategory[] = [
+    'preference',
+    'fact',
+    'instruction',
+    'context',
+  ];
+  await Promise.all(
+    invalidateSlots.map((cat) =>
+      env.PROMPT_CACHE
+        .delete(makeListCacheKey(chatId, cat, resolvedProjectId, DEFAULT_RECALL_LIMIT))
+        .catch(() => {
+          /* best-effort */
+        }),
+    ),
+  );
+
+  return id;
+}
+
+/**
+ * Retrieve relevant memories for a user/project.
+ *
+ * Ordering: most recent first, then highest confidence. Expired facts
+ * (rows whose `expires_at` has passed) are filtered out at the SQL layer.
+ *
+ * Caching: the result is cached in PROMPT_CACHE for 1h keyed by
+ * (chatId, category, projectId, limit). A cache miss falls through to D1.
+ *
+ * @returns Array of MemoryFact (may be empty).
+ */
+export async function recallFacts(
+  env: Env,
+  chatId: number,
+  category?: MemoryCategory,
+  projectId?: string,
+  limit: number = DEFAULT_RECALL_LIMIT,
+): Promise<MemoryFact[]> {
+  const safeLimit = Math.min(Math.max(1, Math.floor(limit)), MAX_RECALL_LIMIT);
+  const safeCategory = category ? coerceMemoryCategory(category) : undefined;
+  const now = nowSeconds();
+
+  // 1) KV cache lookup
+  const cacheKey = makeListCacheKey(chatId, safeCategory, projectId, safeLimit);
+  try {
+    const cached = await env.PROMPT_CACHE.get(cacheKey, 'json');
+    if (cached && Array.isArray(cached)) {
+      return cached as MemoryFact[];
+    }
+  } catch (err) {
+    // Treat any cache read error as a miss.
+    console.warn('[memory_engine] recallFacts KV read failed:', err);
+  }
+
+  // 2) Build the D1 query dynamically
+  const conditions: string[] = ['(expires_at IS NULL OR expires_at > ?)'];
+  const bindings: (string | number | null)[] = [now];
+
+  // Scoping: projectId first, else fall back to user_id resolved from chatId
+  if (projectId) {
+    const userId = await resolveUserId(env, chatId);
+    conditions.push('(project_id = ? OR user_id = ?)');
+    bindings.push(projectId, userId ?? 0);
+  } else {
+    const userId = await resolveUserId(env, chatId);
+    if (userId === null) {
+      // Unknown user → nothing to recall.
+      return [];
+    }
+    conditions.push('user_id = ?');
+    bindings.push(userId);
+  }
+
+  if (safeCategory) {
+    conditions.push('memory_type = ?');
+    bindings.push(safeCategory);
+  }
+
+  const sql =
+    'SELECT id, project_id, user_id, memory_type, content, confidence, ' +
+    'times_reinforced, created_at, last_used, expires_at ' +
+    'FROM project_memory ' +
+    `WHERE ${conditions.join(' AND ')} ` +
+    'ORDER BY created_at DESC, confidence DESC ' +
+    'LIMIT ?';
+  bindings.push(safeLimit);
+
+  let facts: MemoryFact[] = [];
+  try {
+    const result = await env.DB.prepare(sql).bind(...bindings).all<MemoryRow>();
+    facts = (result.results ?? []).map(rowToMemoryFact);
+  } catch (err) {
+    console.error('[memory_engine] recallFacts query failed:', err);
+    return [];
+  }
+
+  // 3) Backfill the KV cache (best-effort)
+  try {
+    await env.PROMPT_CACHE.put(cacheKey, JSON.stringify(facts), {
+      expirationTtl: DEFAULT_MEMORY_CACHE_TTL_SECONDS,
+    });
+  } catch (err) {
+    console.warn('[memory_engine] recallFacts KV put failed:', err);
+  }
+
+  return facts;
+}
+
+/**
+ * Forget (delete) a memory by ID.
+ *
+ * Removes the row from D1 and deletes its individual KV cache entry.
+ * List-cache entries (`memlist:`) are not invalidated here — they will be
+ * refreshed naturally as their 1h TTL expires.
+ *
+ * @returns `true` if a row was deleted, `false` otherwise.
+ */
+export async function forgetFact(env: Env, factId: string): Promise<boolean> {
+  if (!factId) return false;
+
+  let changes = 0;
+  try {
+    const result = await env.DB.prepare(
+      'DELETE FROM project_memory WHERE id = ?',
+    )
+      .bind(factId)
+      .run();
+    changes = result.meta?.changes ?? 0;
+  } catch (err) {
+    console.error('[memory_engine] forgetFact delete failed:', err);
+    return false;
+  }
+
+  if (changes > 0) {
+    // Best-effort KV invalidation for the individual-fact cache entry.
+    try {
+      await env.PROMPT_CACHE.delete(`${KV_FACT_PREFIX}${factId}`);
+    } catch (err) {
+      console.warn('[memory_engine] forgetFact KV delete failed:', err);
+    }
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Map a `MemoryCategory` to a human-readable section title for the prompt
+ * context block.
+ */
+function categoryTitle(category: string): string {
+  switch (category) {
+    case 'preference':
+      return 'User preferences';
+    case 'fact':
+      return 'Facts';
+    case 'instruction':
+      return 'Instructions';
+    case 'context':
+      return 'Context';
+    default:
+      return category.charAt(0).toUpperCase() + category.slice(1);
+  }
+}
+
+/**
+ * Build a "memory context" string to inject into LLM prompts.
+ *
+ * Output format (empty string when no memories):
+ *
+ * ```
+ * User preferences:
+ * - prefers Arabic responses
+ * - concise replies, code blocks only
+ * Facts:
+ * - dentist by profession, runs a clinic in Riyadh
+ * Instructions:
+ * - never run code without confirmation
+ * ```
+ *
+ * Pulls the most recent 30 facts across all categories for the given
+ * chatId (and optional projectId), grouped by category.
+ */
+export async function buildMemoryContext(
+  env: Env,
+  chatId: number,
+  projectId?: string,
+): Promise<string> {
+  const facts = await recallFacts(env, chatId, undefined, projectId, 30);
+  if (facts.length === 0) return '';
+
+  // Group by category, preserving recall order within each group.
+  const grouped = new Map<string, string[]>();
+  for (const f of facts) {
+    const cat = f.category || 'fact';
+    const bucket = grouped.get(cat) ?? [];
+    bucket.push(f.content);
+    grouped.set(cat, bucket);
+  }
+
+  // Render in a fixed, predictable section order.
+  const sectionOrder: MemoryCategory[] = [
+    'preference',
+    'instruction',
+    'fact',
+    'context',
+  ];
+  const seen = new Set<string>();
+  const blocks: string[] = [];
+
+  for (const cat of sectionOrder) {
+    const items = grouped.get(cat);
+    if (!items || items.length === 0) continue;
+    blocks.push(`${categoryTitle(cat)}:\n${items.map((i) => `- ${i}`).join('\n')}`);
+    seen.add(cat);
+  }
+
+  // Append any unexpected categories in insertion order.
+  for (const [cat, items] of grouped) {
+    if (seen.has(cat)) continue;
+    blocks.push(`${categoryTitle(cat)}:\n${items.map((i) => `- ${i}`).join('\n')}`);
+  }
+
+  return blocks.join('\n\n');
 }
