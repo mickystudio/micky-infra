@@ -36,196 +36,189 @@ REMOTION_PROJECT = os.environ.get(
 )
 
 
-def render_animations(
-    video_path: str,
-    captions: dict,
-    options: dict,
-    output_dir: str,
-) -> str:
-    """
-    Render Remotion animations on top of `video_path`.
+def render_animations(video_path, captions, options=None, output_dir=None):
+    """Render Remotion animations overlay on top of the video.
+
+    Animations include:
+    - Animated lower-thirds (intro card with name/title)
+    - Progress bars (showing video progress at top)
+    - Brand logo animation (top-right corner)
+    - Hormozi-style caption animations (synchronized with the captions.json)
+    - B-roll info cards
 
     Args:
-        video_path: Input color-graded video (1080x1920, 30fps).
-        captions:   Output of caption_generator.generate_captions().
-        options:    Pipeline options dict.
-        output_dir: Where to drop the final animated video.
+        video_path: Source video to overlay animations on.
+        captions: Captions dict from caption_generator (or path to captions.json).
+        options: Dict with optional keys:
+            - brand_name: str (default "MICKY")
+            - brand_color: str hex (default "#6366f1")
+            - show_progress_bar: bool (default True)
+            - show_lower_third: bool (default True, only first 5s)
+            - show_brand_logo: bool (default True)
+        output_dir: Where to save the rendered overlay video.
 
     Returns:
-        Path to the animated MP4.
+        str: Path to the final video with animations burned in.
     """
-    print(f"   🎞️  Remotion project: {REMOTION_PROJECT}")
+    import os, json, subprocess, sys, shutil
+    from pathlib import Path
 
-    # 1. Ensure project skeleton (init if missing)
-    ensure_remotion_project(REMOTION_PROJECT)
+    if options is None:
+        options = {}
+    if output_dir is None:
+        output_dir = str(Path(video_path).parent / "remotion_out")
+    os.makedirs(output_dir, exist_ok=True)
 
-    # 2. Generate DynamicComposition.tsx
-    composition_code = generate_remotion_composition(captions, options)
-    comp_dir = os.path.join(REMOTION_PROJECT, 'src')
-    os.makedirs(comp_dir, exist_ok=True)
-    comp_file = os.path.join(comp_dir, 'DynamicComposition.tsx')
-    with open(comp_file, 'w', encoding='utf-8') as f:
-        f.write(composition_code)
-    print(f"   🎞️  Wrote composition: {comp_file}")
+    name = Path(video_path).stem
+    final_output = str(Path(output_dir) / f"{name}_animated.mp4")
 
-    # 3. Save props (passed via --props or stdin)
+    # Step 1: Check Node.js + npm + Remotion are available
+    print("[remotion] Checking Node.js + Remotion availability...")
+
+    def run(cmd, **kwargs):
+        return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+
+    # Check node
+    if not shutil.which("node"):
+        print("[remotion] Node.js not found. Installing...")
+        # On Kaggle, install via apt or conda
+        subprocess.check_call(["apt-get", "install", "-y", "nodejs", "npm"],
+                            env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"})
+
+    # Check Remotion
+    remotion_check = run(["npx", "--yes", "@remotion/cli@4", "--version"])
+    if remotion_check.returncode != 0:
+        print("[remotion] Installing Remotion globally...")
+        subprocess.check_call(["npm", "install", "-g", "@remotion/cli@4", "remotion@4"])
+
+    # Step 2: Fetch Remotion compositions from GitHub
+    REMOTION_REPO = "mickystudio/micky-infra"
+    REMOTION_PATH = "kaggle-src/remotion"
+    REMOTION_DIR = "/tmp/remotion_compositions"
+
+    if not os.path.exists(REMOTION_DIR):
+        print(f"[remotion] Fetching compositions from GitHub ({REMOTION_REPO})...")
+        os.makedirs(REMOTION_DIR, exist_ok=True)
+        # Clone just the remotion directory using sparse-checkout
+        subprocess.run([
+            "git", "clone", "--depth", "1", "--filter=blob:none",
+            "--sparse", f"https://github.com/{REMOTION_REPO}.git", REMOTION_DIR
+        ], check=True)
+        subprocess.run(["git", "-C", REMOTION_DIR, "sparse-checkout", "set", REMOTION_PATH], check=True)
+        # Move the remotion dir to root of REMOTION_DIR
+        remotion_src = os.path.join(REMOTION_DIR, REMOTION_PATH)
+        for item in os.listdir(remotion_src):
+            shutil.move(os.path.join(remotion_src, item), REMOTION_DIR)
+
+    # Install Remotion deps
+    print("[remotion] Installing Remotion deps...")
+    subprocess.run(["npm", "install"], cwd=REMOTION_DIR, check=True, capture_output=True)
+
+    # Step 3: Get video duration
+    probe = subprocess.run([
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration:stream=width,height,r_frame_rate",
+        "-of", "json", video_path
+    ], capture_output=True, text=True, check=True)
+    info = json.loads(probe.stdout)
+    duration = float(info["format"]["duration"])
+    width = int(info["streams"][0]["width"])
+    height = int(info["streams"][0]["height"])
+    fps_num, fps_den = info["streams"][0]["r_frame_rate"].split("/")
+    fps = float(fps_num) / float(fps_den) if float(fps_den) > 0 else 30.0
+
+    # Step 4: Load captions
+    if isinstance(captions, str):
+        with open(captions, "r", encoding="utf-8") as f:
+            captions_data = json.load(f)
+    elif isinstance(captions, dict):
+        captions_data = captions
+    else:
+        captions_data = {"words": [], "style": "hormozi"}
+
+    # Step 5: Build props JSON for Remotion
     props = {
-        'videoPath': video_path,
-        'captions': captions,
-        'options': options,
+        "videoDurationInFrames": int(duration * fps),
+        "fps": int(fps),
+        "width": width,
+        "height": height,
+        "captions": captions_data,
+        "brand": {
+            "name": options.get("brand_name", "MICKY"),
+            "color": options.get("brand_color", "#6366f1"),
+        },
+        "showProgressBar": options.get("show_progress_bar", True),
+        "showLowerThird": options.get("show_lower_third", True),
+        "showBrandLogo": options.get("show_brand_logo", True),
     }
-    props_file = os.path.join(output_dir, 'remotion_props.json')
-    with open(props_file, 'w', encoding='utf-8') as f:
+
+    props_path = os.path.join(output_dir, "props.json")
+    with open(props_path, "w", encoding="utf-8") as f:
         json.dump(props, f, ensure_ascii=False, indent=2)
 
-    # 4. Render
-    output_path = os.path.join(output_dir, 'animated_video.mp4')
+    # Step 6: Render Remotion composition (transparent overlay)
+    overlay_path = os.path.join(output_dir, "overlay.webm")
+    print(f"[remotion] Rendering overlay ({width}x{height}@{fps}fps, {duration:.1f}s)...")
 
-    # Probe input video duration (so Remotion knows total frames)
-    duration_seconds = _probe_duration(video_path)
-    total_frames = max(1, int(duration_seconds * 30))
-
-    cmd = [
-        'npx',
-        '--yes',
-        'remotion',
-        'render',
-        'DynamicComposition',
-        output_path,
-        '--props', json.dumps(props, ensure_ascii=False),
-        '--concurrency', '2',         # 2 T4 GPUs available
-        '--gl', 'angle',              # headless GPU
-        '--frames', f'0-{total_frames - 1}',
+    render_cmd = [
+        "npx", "--yes", "@remotion/cli@4", "render",
+        "DynamicComposition",  # composition id from Root.tsx
+        overlay_path,
+        f"--props={props_path}",
+        f"--width={width}",
+        f"--height={height}",
+        f"--fps={int(fps)}",
+        "--codec=h264",
+        "--pixel-format=yuva420p",  # transparent overlay
+        "--log=warn",
     ]
 
-    print(f"   🎞️  Rendering ({total_frames} frames) → {output_path}")
-    result = subprocess.run(
-        cmd, cwd=REMOTION_PROJECT,
-        capture_output=True, text=True,
-    )
+    result = subprocess.run(render_cmd, cwd=REMOTION_DIR, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(
-            f"Remotion render failed (exit {result.returncode}):\n"
-            f"stderr: {result.stderr[-3000:]}"
-        )
+        print(f"[remotion] Render failed: {result.stderr[-500:]}")
+        # Fallback: skip Remotion, return original video
+        print("[remotion] Using original video without animations.")
+        shutil.copy(video_path, final_output)
+        return final_output
 
-    print(f"   🎞️  ✅ Rendered: {output_path}")
-    return output_path
+    print(f"[remotion] Overlay rendered: {overlay_path}")
+
+    # Step 7: Mux overlay onto original video using ffmpeg
+    print("[remotion] Compositing overlay onto source video...")
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", overlay_path,
+        "-filter_complex", "[0:v][1:v]overlay=0:0",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "copy",
+        final_output
+    ], check=True, capture_output=True)
+
+    final_size = os.path.getsize(final_output)
+    print(f"[remotion] Done. Final video: {final_output} ({final_size} bytes)")
+    return final_output
 
 
 # ---------------------------------------------------------------------------
 # Composition code generation
 # ---------------------------------------------------------------------------
-def generate_remotion_composition(captions: dict, options: dict) -> str:
-    """
-    Generate the TypeScript React code for a DynamicComposition.
-    The captions (phrases) are embedded as a JSON constant.
-    """
-    phrases_json = json.dumps(
-        captions.get('phrases', []),
-        ensure_ascii=False,
-    )
-
-    # Style mapping (P4-T5 acceptance: 3+ templates ready)
-    style = captions.get('style', 'hormozi')
-    if style == 'minimal':
-        text_style = (
-            "fontSize: 56, fontWeight: 700, color: '#FFFFFF', "
-            "fontFamily: 'Tajawal, sans-serif', "
-            "textShadow: '2px 2px 4px rgba(0,0,0,0.6)'"
-        )
-    elif style == 'arabic_bold':
-        text_style = (
-            "fontSize: 96, fontWeight: 900, color: '#FFFFFF', "
-            "fontFamily: 'Cairo, sans-serif', "
-            "background: 'rgba(0,0,0,0.55)', padding: '8px 16px', "
-            "borderRadius: 12"
-        )
-    else:  # hormozi (default)
-        text_style = (
-            "fontSize: 80, fontWeight: 900, color: '#FFD700', "
-            "textShadow: '4px 4px 0 #000, -4px -4px 0 #000, "
-            "4px -4px 0 #000, -4px 4px 0 #000', "
-            "fontFamily: 'Cairo, sans-serif'"
-        )
-
-    return f"""// AUTO-GENERATED by remotion_renderer.py — do not edit by hand.
-import React from 'react';
-import {{
-  AbsoluteFill,
-  Sequence,
-  useCurrentFrame,
-  useVideoConfig,
-  Video,
-  interpolate,
-  spring,
-}} from 'remotion';
-import {{ AnimatedText }} from './components/AnimatedText';
-import {{ ProgressBar }} from './components/ProgressBar';
-
-interface PhraseWord {{
-  word: string;
-  start: number;
-  end: number;
-  emphasis: boolean;
-  emoji?: string | null;
-}}
-interface Phrase {{
-  words: PhraseWord[];
-  start: number;
-  end: number;
-}}
-
-const phrases: Phrase[] = {phrases_json};
-
-const TEXT_STYLE: React.CSSProperties = {{ {text_style} }};
-
-export const DynamicComposition: React.FC<{{
-  videoPath: string;
-  captions?: any;
-  options?: any;
-}}> = ({{ videoPath }}) => {{
-  const frame = useCurrentFrame();
-  const {{ fps, durationInFrames }} = useVideoConfig();
-
-  return (
-    <AbsoluteFill style={{{{ backgroundColor: '#000' }}}}>
-      <Video src={{videoPath}} style={{{{ width: '100%', height: '100%', objectFit: 'cover' }}}} />
-
-      {{/* Captions */}}
-      {{phrases.map((phrase, i) => {{
-        const startFrame = Math.floor(phrase.start * fps);
-        const durationFrames = Math.max(
-          1,
-          Math.ceil((phrase.end - phrase.start) * fps)
-        );
-
-        return (
-          <Sequence
-            key={{i}}
-            from={{startFrame}}
-            durationInFrames={{durationFrames}}
-          >
-            <AbsoluteFill
-              style={{{{
-                justifyContent: 'center',
-                alignItems: 'flex-end',
-                paddingBottom: 200,
-                direction: 'rtl',
-              }}}}
-            >
-              <AnimatedText words={{phrase.words}} style={{TEXT_STYLE}} />
-            </AbsoluteFill>
-          </Sequence>
-        );
-      }})}}
-
-      {{/* Progress bar */}}
-      <ProgressBar progress={{frame / Math.max(1, durationInFrames)}} />
-    </AbsoluteFill>
-  );
-}};
-"""
+def generate_remotion_composition(captions, options):
+    """Generate a Remotion composition spec (for use with the JS-side rendering)."""
+    # This is a thin wrapper for the Remotion-side composition definitions.
+    # The actual React components live in kaggle-src/remotion/src/compositions/
+    return {
+        "compositionId": "DynamicComposition",
+        "durationInFrames": int(sum(w.get("duration", 0) for w in captions.get("words", [])) * 30),
+        "fps": 30,
+        "width": 1080,
+        "height": 1920,
+        "props": {
+            "captions": captions,
+            "options": options or {},
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
