@@ -1,0 +1,4 @@
+# Cloudflare Pages SPA fallback — all routes serve index.html
+# (Cloudflare Pages auto-detects SPA when this file exists)
+
+/*    /index.html   200
