@@ -35,6 +35,8 @@ interface KagglePushResponse {
   ref?: string;
   id?: string;
   url?: string;
+  error?: string;
+  hasError?: boolean;
 }
 
 interface KaggleStatusResponse {
@@ -102,10 +104,16 @@ export async function dispatchToKaggle(env: Env, task: Task): Promise<string> {
     );
   }
 
-  const data = (await response.json()) as KagglePushResponse & { error?: string };
+  const data = (await response.json()) as KagglePushResponse;
 
-  // Kaggle returns ref like "username/kernel-slug" — use it as the kernel id.
-  const kernelId = data.ref ?? data.id ?? kernelSlug;
+  // Kaggle returns HTTP 200 even when there's a logical error (e.g. GPU limit hit).
+  // Check hasError flag and error field explicitly.
+  if (data.hasError || data.error) {
+    throw new Error(`Kaggle push rejected: ${data.error || 'unknown error'}`);
+  }
+
+  // Kaggle returns ref like "/code/username/kernel-slug" — use it as the kernel id.
+  const kernelId = data.ref || data.id || kernelSlug;
   if (!kernelId) {
     throw new Error('Kaggle push succeeded but returned no kernel id');
   }
@@ -237,8 +245,11 @@ export async function stopKaggleKernel(env: Env, kernelId: string): Promise<bool
  * Kaggle requires lowercase, ASCII, hyphenated, ≤50 chars.
  */
 function buildKernelSlug(task: Task): string {
-  const suffix = task.id.replace(/[^a-z0-9-]/gi, '').toLowerCase().slice(0, 32);
-  return `${KERNEL_SLUG_PREFIX}-${task.type}-${suffix}`;
+  // Use full task.id (uuid) + timestamp suffix to guarantee uniqueness across retries.
+  // Kaggle slugs must be lowercase ASCII, hyphenated, ≤50 chars.
+  const idPart = task.id.replace(/[^a-z0-9-]/gi, '').toLowerCase().slice(0, 24);
+  const ts = Date.now().toString(36).slice(-6); // ~6 chars base36
+  return `${KERNEL_SLUG_PREFIX}-${task.type}-${idPart}-${ts}`;
 }
 
 /**
