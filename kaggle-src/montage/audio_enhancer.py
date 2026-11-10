@@ -189,3 +189,25 @@ def _run_ffmpeg(cmd: list[str]) -> None:
             f"command: {' '.join(cmd)}\n"
             f"stderr: {result.stderr[-2000:]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Standalone CLI (for debugging)
+# ---------------------------------------------------------------------------
+if __name__ == '__main__':
+    import sys
+
+    if len(sys.argv) < 3:
+        print('Usage: audio_enhancer.py <video_path> <output_dir>')
+        sys.exit(1)
+
+    _video_path = sys.argv[1]
+    _output_dir = sys.argv[2]
+
+    _enhanced = enhance_audio(_video_path, _output_dir)
+    print(f'Enhanced audio → {_enhanced}')
+
+    # Optional: re-mux enhanced audio back into the input video
+    _muxed = os.path.join(_output_dir, 'audio_swapped.mp4')
+    replace_audio_in_video(_video_path, _enhanced, _muxed)
+    print(f'Audio-swapped video → {_muxed}')
