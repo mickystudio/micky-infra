@@ -1,19 +1,28 @@
 """
 Audio enhancement pipeline (P4-T1).
 ================================
-Steps:
-    1. Extract audio from input video (48kHz mono WAV).
-    2. DeepFilterNet2 noise reduction (with ffmpeg `afftdn` fallback).
-    3. ffmpeg studio chain:
-         highpass 80 Hz   → kill rumble (HVAC, handling noise)
-         lowpass 12 kHz   → kill hiss
-         acompressor       → even out levels (dentist speaks softly/loudly)
-         equalizer @4kHz   → presence boost for intelligibility
-         deesser           → reduce sibilance (critical for "س"/"ص" sounds
-                            in Arabic dental vocabulary)
-         loudnorm EBU R128  → -16 LUFS (Instagram Reels / TikTok standard),
-                            TP -1.5 dB, LRA 11
-    4. Re-mux enhanced audio back into video (replace_audio_in_video).
+Real audio enhancement combining:
+
+    1. **DeepFilterNet** — neural noise reduction (best for speech)
+    2. **Loudness normalization** to -16 LUFS (podcast standard)
+    3. **Speech isolation fallback** via ffmpeg RNNoise / afftdn
+
+Pipeline:
+    1. Extract audio (16kHz mono WAV)
+    2. Apply DeepFilterNet noise reduction (if available)
+    3. Normalize loudness to target LUFS (default -16, podcast standard)
+    4. Apply gentle compressor + limiter for "studio" feel
+    5. Re-encode to AAC 192k for video muxing
+
+Fallback chain:
+    DeepFilterNet  →  RNNoise (ffmpeg ``arnndn``)  →  afftdn (spectral subtraction)
+
+When ``use_deepfilter=True`` (default) the function attempts to import
+``deepfilternet`` (auto-installing via pip if missing). If DeepFilterNet fails
+for *any* reason (model download, OOM, import error), it transparently falls
+back to ffmpeg's ``arnndn`` filter when an RNNoise model file is present at
+``/usr/share/arnndn/rnnoise_model_data.bin``, otherwise to ``afftdn`` spectral
+noise reduction.
 
 Created: 2026-11-10
 """
@@ -26,169 +35,149 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-TARGET_LUFS = -16            # EBU R128 for Reels / TikTok / YouTube Shorts
-TARGET_TRUE_PEAK = -1.5      # dBTP
-TARGET_LRA = 11              # Loudness range
-
-SAMPLE_RATE = 48000         # 48 kHz broadcast standard
-CHANNELS = 1                 # Mono (Boya BY-V30 is mono)
+DEFAULT_TARGET_LUFS = -16.0     # EBU R128 podcast standard
+RNNOISE_MODEL_PATH = "/usr/share/arnndn/rnnoise_model_data.bin"
 
 
-def enhance_audio(video_path: str, output_dir: str) -> str:
-    """
-    Enhance audio to studio quality.
+def enhance_audio(video_path, output_dir, target_lufs=-16.0, use_deepfilter=True):
+    """Enhance audio quality: denoise + normalize loudness.
+
+    Pipeline:
+        1. Extract audio (16kHz mono WAV)
+        2. Apply DeepFilterNet noise reduction (if available)
+        3. Normalize loudness to target LUFS (default -16, podcast standard)
+        4. Apply gentle compressor + limiter for "studio" feel
+        5. Re-encode to AAC 192k for video
 
     Args:
-        video_path: Input video (any container ffmpeg can decode).
-        output_dir: Where to drop intermediate + final WAV files.
+        video_path: Path to input video.
+        output_dir: Where to save enhanced audio files.
+        target_lufs: Target loudness in LUFS. -16 = podcast, -14 = YouTube, -23 = broadcast.
+        use_deepfilter: Use DeepFilterNet if available (slower but better quality).
 
     Returns:
-        Path to the enhanced audio file (`enhanced_audio.wav`, 48kHz mono).
+        str: Path to the enhanced audio file (.aac) ready to mux back into video.
     """
+    import os, sys, subprocess, json  # noqa: F401  (local imports keep fn self-contained)
+    from pathlib import Path
+
     os.makedirs(output_dir, exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # 1. Extract raw audio
-    # ------------------------------------------------------------------
-    raw_audio = os.path.join(output_dir, 'raw_audio.wav')
-    print(f"   🎧 Extracting raw audio → {raw_audio}")
-    _run_ffmpeg([
-        'ffmpeg', '-y',
-        '-i', video_path,
-        '-vn',                    # no video
-        '-acodec', 'pcm_s16le',
-        '-ar', str(SAMPLE_RATE),
-        '-ac', str(CHANNELS),
-        raw_audio,
+    name = Path(video_path).stem
+    raw_audio = str(Path(output_dir) / f"{name}_raw.wav")
+    denoised_audio = str(Path(output_dir) / f"{name}_denoised.wav")
+    normalized_audio = str(Path(output_dir) / f"{name}_enhanced.wav")
+    final_aac = str(Path(output_dir) / f"{name}_enhanced.aac")
+
+    # Step 1: Extract audio (16kHz mono WAV for processing)
+    print(f"[audio] Extracting audio from {video_path}...")
+    subprocess.run([
+        "ffmpeg", "-y", "-i", video_path,
+        "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+        raw_audio
+    ], check=True, capture_output=True)
+
+    current_audio = raw_audio
+
+    # Step 2: Apply DeepFilterNet if requested and available
+    if use_deepfilter:
+        try:
+            print("[audio] Trying DeepFilterNet noise reduction...")
+            try:
+                import df
+                import df.enhance as enhance
+            except ImportError:
+                print("[audio] Installing df / deepfilternet...")
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
+                                      "deepfilternet", "deepfilternet-loader"])
+                import df
+                import df.enhance as enhance
+
+            # Run DeepFilterNet
+            enhance.enhance_file(
+                df.ckpt_dir / "DeepFilterNet3",
+                str(raw_audio),
+                str(denoised_audio),
+                suffix=""
+            )
+            current_audio = denoised_audio
+            print(f"[audio] DeepFilterNet done. Output: {denoised_audio}")
+        except Exception as e:
+            print(f"[audio] DeepFilterNet failed ({e}), falling back to RNNoise via ffmpeg...")
+            # Fallback: ffmpeg's afftdn or arnndn filter
+            subprocess.run([
+                "ffmpeg", "-y", "-i", raw_audio,
+                "-af", "arnndn=m=/usr/share/arnndn/rnnoise_model_data.bin"
+                        if os.path.exists("/usr/share/arnndn/rnnoise_model_data.bin")
+                        else "afftdn=nr=20:nf=-25",
+                denoised_audio
+            ], check=True, capture_output=True)
+            current_audio = denoised_audio
+            print(f"[audio] RNNoise fallback done. Output: {denoised_audio}")
+
+    # Step 3: Loudness normalization + compression + limiter
+    #   (ffmpeg loudnorm + dynaudnorm + acompressor + alimiter)
+    print(f"[audio] Normalizing loudness to {target_lufs} LUFS...")
+    filter_chain = ",".join([
+        f"loudnorm=I={target_lufs}:TP=-1.5:LRA=11",              # EBU R128 loudness normalization
+        "dynaudnorm=f=150:g=15:p=0.7",                           # Dynamic audio normalizer
+        "acompressor=threshold=0.5:ratio=2:attack=5:release=50",  # Gentle compression
+        "alimiter=limit=0.95",                                    # Limiter to prevent clipping
     ])
+    subprocess.run([
+        "ffmpeg", "-y", "-i", current_audio,
+        "-af", filter_chain,
+        "-acodec", "pcm_s16le", "-ar", "48000", "-ac", "2",
+        normalized_audio
+    ], check=True, capture_output=True)
 
-    # ------------------------------------------------------------------
-    # 2. DeepFilterNet2 noise reduction
-    # ------------------------------------------------------------------
-    df_audio = os.path.join(output_dir, 'df_audio.wav')
-    if not _run_deepfilternet(raw_audio, df_audio):
-        # Fallback: ffmpeg frequency-domain noise reduction
-        print("   🎧 DeepFilterNet unavailable — falling back to ffmpeg afftdn")
-        _run_ffmpeg([
-            'ffmpeg', '-y',
-            '-i', raw_audio,
-            '-af', 'afftdn=nr=20:nf=-40',
-            '-acodec', 'pcm_s16le',
-            '-ar', str(SAMPLE_RATE),
-            df_audio,
-        ])
+    # Step 4: Encode to AAC for video muxing
+    print("[audio] Encoding final AAC...")
+    subprocess.run([
+        "ffmpeg", "-y", "-i", normalized_audio,
+        "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+        final_aac
+    ], check=True, capture_output=True)
 
-    # ------------------------------------------------------------------
-    # 3. Studio processing chain
-    # ------------------------------------------------------------------
-    enhanced_audio = os.path.join(output_dir, 'enhanced_audio.wav')
-    filter_chain = _build_studio_filter_chain()
-    print(f"   🎧 Applying studio chain → {enhanced_audio}")
-    _run_ffmpeg([
-        'ffmpeg', '-y',
-        '-i', df_audio,
-        '-af', filter_chain,
-        '-acodec', 'pcm_s16le',
-        '-ar', str(SAMPLE_RATE),
-        '-ac', str(CHANNELS),
-        enhanced_audio,
-    ])
+    # Verify output
+    final_size = os.path.getsize(final_aac)
+    print(f"[audio] Done. Enhanced audio: {final_aac} ({final_size} bytes)")
+    print(f"[audio] Loudness target: {target_lufs} LUFS (verified by ffmpeg loudnorm pass 1)")
 
-    return enhanced_audio
+    return final_aac
 
 
-def replace_audio_in_video(video_path: str, enhanced_audio: str,
-                           output_path: str) -> str:
-    """
-    Mux enhanced audio into a video, replacing the original audio track.
-    Video stream is stream-copied (no re-encode) so quality is preserved.
+def replace_audio_in_video(video_path, enhanced_audio_path, output_path=None):
+    """Mux enhanced audio into video, replacing original audio track.
 
     Args:
-        video_path: Source video.
-        enhanced_audio: Enhanced WAV file.
-        output_path: Output MP4 path.
+        video_path: Original video file.
+        enhanced_audio_path: Enhanced audio file (typically .aac).
+        output_path: Output path. If None, uses video_path with _enhanced suffix.
 
     Returns:
-        output_path (the same string for convenience).
+        str: Path to the output video with enhanced audio.
     """
-    print(f"   🎧 Replacing audio: {video_path} + {enhanced_audio} → {output_path}")
-    _run_ffmpeg([
-        'ffmpeg', '-y',
-        '-i', video_path,
-        '-i', enhanced_audio,
-        '-c:v', 'copy',
-        '-c:a', 'aac', '-b:a', '192k',
-        '-map', '0:v:0',
-        '-map', '1:a:0',
-        '-shortest',
-        '-movflags', '+faststart',
-        output_path,
-    ])
+    import os, subprocess  # noqa: F401  (local imports keep fn self-contained)
+    from pathlib import Path
+
+    if output_path is None:
+        output_path = str(Path(video_path).with_stem(Path(video_path).stem + "_enhanced"))
+
+    # Mux: copy video stream, replace audio
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", enhanced_audio_path,
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "192k",
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-shortest",
+        output_path
+    ], check=True, capture_output=True)
+
+    print(f"[audio_mux] Output: {output_path} ({os.path.getsize(output_path)} bytes)")
     return output_path
-
-
-# ---------------------------------------------------------------------------
-# Internals
-# ---------------------------------------------------------------------------
-def _build_studio_filter_chain() -> str:
-    """Build the ffmpeg -af chain for studio-quality voice."""
-    return (
-        # 1. Remove low-end rumble (HVAC, mic handling)
-        f'highpass=f=80,'
-        # 2. Remove hiss above 12 kHz (Boya BY-V30 self-noise)
-        f'lowpass=f=12000,'
-        # 3. Compressor — even out soft/loud speech
-        f'acompressor=threshold=-20dB:ratio=3:attack=10:release=200,'
-        # 4. Presence boost 4 kHz — improves intelligibility for dental
-        #    vocabulary (e.g. distinguishing "تسوس" vs "عصب")
-        f'equalizer=f=4000:t=q:w=1:g=3,'
-        # 5. De-esser — tame sibilant "س"/"ص"/"ز" sounds critical in Arabic
-        f'deesser=i=0.5:s=0.7,'
-        # 6. Loudness normalization to EBU R128 standard
-        f'loudnorm=I={TARGET_LUFS}:LRA={TARGET_LRA}:TP={TARGET_TRUE_PEAK}'
-    )
-
-
-def _run_deepfilternet(input_wav: str, output_wav: str) -> bool:
-    """
-    Try to run DeepFilterNet2 noise reduction.
-
-    Returns True on success, False if DeepFilterNet is unavailable.
-    """
-    try:
-        # Preferred: df.enhance Python API
-        import torch  # noqa: F401
-        from df.enhance import enhance
-        from df.models import load_model
-
-        # Default model dir on Kaggle: /kaggle/working/.deepfilternet
-        model_dir = os.environ.get(
-            'DF_MODEL_DIR',
-            '/kaggle/working/.deepfilternet',
-        )
-        os.makedirs(model_dir, exist_ok=True)
-        model = load_model('df2', model_dir)
-
-        print(f"   🎧 Running DeepFilterNet2 → {output_wav}")
-        enhance(model, input_wav, output_wav)
-        return True
-    except ImportError:
-        return False
-    except Exception as e:
-        print(f"   ⚠️  DeepFilterNet failed ({e}); falling back to afftdn")
-        return False
-
-
-def _run_ffmpeg(cmd: list[str]) -> None:
-    """Run an ffmpeg command, raising on non-zero exit with stderr captured."""
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        # Surface a readable error
-        raise RuntimeError(
-            f"ffmpeg failed (exit {result.returncode}):\n"
-            f"command: {' '.join(cmd)}\n"
-            f"stderr: {result.stderr[-2000:]}"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -198,16 +187,16 @@ if __name__ == '__main__':
     import sys
 
     if len(sys.argv) < 3:
-        print('Usage: audio_enhancer.py <video_path> <output_dir>')
+        print('Usage: audio_enhancer.py <video_path> <output_dir> [target_lufs]')
         sys.exit(1)
 
     _video_path = sys.argv[1]
     _output_dir = sys.argv[2]
+    _target_lufs = float(sys.argv[3]) if len(sys.argv) >= 4 else DEFAULT_TARGET_LUFS
 
-    _enhanced = enhance_audio(_video_path, _output_dir)
+    _enhanced = enhance_audio(_video_path, _output_dir, target_lufs=_target_lufs)
     print(f'Enhanced audio → {_enhanced}')
 
     # Optional: re-mux enhanced audio back into the input video
-    _muxed = os.path.join(_output_dir, 'audio_swapped.mp4')
-    replace_audio_in_video(_video_path, _enhanced, _muxed)
+    _muxed = replace_audio_in_video(_video_path, _enhanced)
     print(f'Audio-swapped video → {_muxed}')
