@@ -106,10 +106,16 @@ def run_pipeline(
             transcript = {'segments': [], 'text': ''}
         else:
             language = options.get('language', DEFAULT_LANGUAGE)
-            transcript = transcribe_video(input_video_path, language=language)
-            transcript_path = os.path.join(output_dir, 'transcript.json')
+            # New signature: transcribe_video(video_path, output_dir, model_size="base")
+            # Old signature passed `language=` which is no longer supported.
+            # Whisper auto-detects language; if user wants to force, they should pass `model_size` instead.
+            model_size = options.get('whisper_model', 'base' if language == 'en' else 'small')
+            transcript = transcribe_video(input_video_path, output_dir, model_size=model_size)
+            # transcribe_video already writes transcript.json internally, but we keep
+            # the explicit save for backward compat (it overwrites with the same content).
+            transcript_path = transcript.get('transcript_path', os.path.join(output_dir, 'transcript.json'))
             with open(transcript_path, 'w', encoding='utf-8') as f:
-                json.dump(transcript, f, ensure_ascii=False, indent=2)
+                json.dump(transcript, f, ensure_ascii=False, indent=2, default=str)
             word_count = sum(len(s.get('words', [])) for s in transcript.get('segments', []))
             print(f"   ✅ {word_count} words, {len(transcript.get('segments', []))} segments")
             print(f"   📁 Saved: {transcript_path}")
@@ -401,43 +407,106 @@ def run_pipeline_from_spec(input_spec: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Whisper transcription (Stage 1)
 # ---------------------------------------------------------------------------
-def transcribe_video(video_path: str, language: str = 'ar') -> dict:
-    """
-    Transcribe video using Whisper large-v3 with word-level timestamps.
+def transcribe_video(video_path, output_dir, model_size="base"):
+    """Transcribe audio from video using OpenAI Whisper.
 
     Args:
-        video_path: Path to source video file.
-        language: ISO code ('ar', 'en'). Whisper will be hinted this language.
+        video_path: Path to input video file.
+        output_dir: Directory to save transcript.json.
+        model_size: Whisper model size ('tiny', 'base', 'small', 'medium',
+                    'large'). Default 'base' for balance of speed/accuracy.
 
     Returns:
-        Whisper result dict with keys: 'text', 'segments' (each containing
-        'words' list of {word, start, end}).
+        dict: {"text": str, "segments": [...], "language": str,
+               "transcript_path": str}
     """
-    try:
-        import torch
-        import whisper
-    except ImportError as e:
-        raise RuntimeError(
-            "Whisper is required for transcription but is not installed. "
-            "On Kaggle, run: `!pip install -q openai-whisper` "
-            "(see montage_pipeline.ipynb Cell 2). "
-            f"Original error: {e}"
-        ) from e
+    import json
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"   🔧 Loading Whisper large-v3 on {device}...")
-    model = whisper.load_model('large-v3', device=device)
+    os.makedirs(output_dir, exist_ok=True)
+    audio_path = str(Path(output_dir) / "audio.wav")
+    transcript_path = str(Path(output_dir) / "transcript.json")
 
-    print(f"   🔧 Transcribing {video_path} (language={language})...")
-    result = model.transcribe(
-        video_path,
-        word_timestamps=True,
-        language=language,
-        verbose=False,
-        # Improve Arabic accuracy
-        initial_prompt='مرحباً، أنا طبيب أسنان وأتحدث عن صحة الفم والأسنان.',
+    # Step 1: Extract audio with ffmpeg (16kHz mono PCM, required by Whisper)
+    print(f"[transcribe] Extracting audio from {video_path}...")
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", video_path,
+            "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+            audio_path,
+        ],
+        check=True,
+        capture_output=True,
     )
-    return result
+
+    # Step 2: Install openai-whisper if missing (Kaggle: first-run only)
+    try:
+        import whisper
+    except ImportError:
+        print("[transcribe] Installing openai-whisper...")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "-q", "openai-whisper"]
+        )
+        import whisper
+
+    # Step 3: Load model (cached at /root/.cache/whisper after first download)
+    print(f"[transcribe] Loading Whisper '{model_size}' model...")
+    model = whisper.load_model(model_size)
+
+    # Step 4: Transcribe
+    print(f"[transcribe] Transcribing {audio_path}...")
+    result = model.transcribe(audio_path, verbose=False)
+
+    # Step 5: Save transcript (normalized, JSON-serializable)
+    with open(transcript_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "text": result["text"],
+                "segments": [
+                    {
+                        "id": s["id"],
+                        "start": s["start"],
+                        "end": s["end"],
+                        "text": s["text"].strip(),
+                    }
+                    for s in result["segments"]
+                ],
+                "language": result.get("language", "unknown"),
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    print(f"[transcribe] Done. Transcript saved to {transcript_path}")
+    print(f"[transcribe] Language: {result.get('language', '?')}")
+    preview = (result.get("text") or "")[:200]
+    print(f"[transcribe] Text preview: {preview}...")
+
+    return {
+        "text": result["text"],
+        "segments": result["segments"],
+        "language": result.get("language", "unknown"),
+        "transcript_path": transcript_path,
+    }
+
+
+def get_transcript_text(transcript_result):
+    """Extract plain text from transcribe_video() result.
+
+    Args:
+        transcript_result: dict returned by transcribe_video(), or any
+                           object that can be coerced to a string.
+
+    Returns:
+        str: the transcribed text, or empty string if unavailable.
+    """
+    if isinstance(transcript_result, dict):
+        return transcript_result.get("text", "") or ""
+    return str(transcript_result)
 
 
 # ---------------------------------------------------------------------------
