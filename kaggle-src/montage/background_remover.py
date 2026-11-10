@@ -68,90 +68,180 @@ FRAME_H = 1920
 FPS = 30
 
 
-def remove_background(video_path: str, bg_choice: str, output_dir: str) -> str:
-    """
-    Remove background using RVM and composite with a new background.
+def remove_background(video_path, bg_choice="transparent", output_dir=None):
+    """Remove video background using Robust Video Matting (RVM).
 
     Args:
-        video_path: Input video (audio already enhanced).
-        bg_choice:  Key into BACKGROUNDS (falls back to 'dental_office').
-        output_dir: Scratch + output directory.
+        video_path: Path to input video.
+        bg_choice: One of 'transparent', 'white', 'black', 'green', 'blur', or a path to a background image.
+        output_dir: Where to save the output. If None, uses video_path's parent.
 
     Returns:
-        Path to the matted MP4 (with original audio stream preserved).
+        str: Path to the output video with background removed/replaced.
     """
-    _ensure_torch_deps()
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"   🖼️  RVM on {device} | background='{bg_choice}'")
-    # --- Load model + background ---------------------------------------------
-    model = load_rvm_model(device=device)
-    background = load_background(
-        BACKGROUNDS.get(bg_choice, BACKGROUNDS['dental_office']),
-        device=device,
-    )
+    import os, sys, subprocess
+    from pathlib import Path
+    import shutil
 
-    # --- Extract frames ------------------------------------------------------
-    frames_dir = os.path.join(output_dir, 'frames')
-    matted_dir = os.path.join(output_dir, 'matted')
+    video_path = str(video_path)
+    if output_dir is None:
+        output_dir = str(Path(video_path).parent / "output")
+    os.makedirs(output_dir, exist_ok=True)
+
+    name = Path(video_path).stem
+    output_path = str(Path(output_dir) / f"{name}_nobg.mp4")
+
+    print(f"[bg_remove] Processing {video_path} with bg='{bg_choice}'...")
+
+    # Step 1: Install dependencies if missing
+    try:
+        import torch
+        print(f"[bg_remove] torch version: {torch.__version__}, CUDA: {torch.cuda.is_available()}")
+    except ImportError:
+        print("[bg_remove] Installing torch...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
+                              "torch", "torchvision", "--index-url",
+                              "https://download.pytorch.org/whl/cu121"])
+        import torch
+
+    # Step 2: Load RVM model from torch hub
+    print("[bg_remove] Loading RobustVideoMatting model...")
+    try:
+        model = torch.hub.load("PeterL1n/RobustVideoMatting", "mobilenetv3", trust_repo=True)
+    except Exception as e:
+        print(f"[bg_remove] torch.hub.load failed: {e}, trying direct download...")
+        # Fallback: clone repo and load manually
+        repo_dir = "/tmp/RobustVideoMatting"
+        if not os.path.exists(repo_dir):
+            subprocess.check_call(["git", "clone", "--depth", "1",
+                                   "https://github.com/PeterL1n/RobustVideoMatting.git", repo_dir])
+        sys.path.insert(0, repo_dir)
+        from model.rvm import MobileNetV3Matting
+        model = MobileNetV3Matting()
+
+    if torch.cuda.is_available():
+        model = model.cuda()
+        print("[bg_remove] Using GPU (CUDA)")
+    else:
+        print("[bg_remove] WARNING: No GPU available, will be very slow on CPU")
+    model.eval()
+
+    # Step 3: Process video with RVM inference
+    # Use the official inference.py script's API
+    import numpy as np
+    from PIL import Image
+    import torchvision.transforms as T
+
+    # Extract frames first using ffmpeg
+    frames_dir = str(Path(output_dir) / "frames_input")
     os.makedirs(frames_dir, exist_ok=True)
-    os.makedirs(matted_dir, exist_ok=True)
+    print(f"[bg_remove] Extracting frames to {frames_dir}...")
+    subprocess.run([
+        "ffmpeg", "-y", "-i", video_path,
+        "-q:v", "1", os.path.join(frames_dir, "%08d.png")
+    ], check=True, capture_output=True)
 
-    # Clean previous frames (in case of retry)
-    for f in Path(frames_dir).glob('*.png'):
-        f.unlink()
-    for f in Path(matted_dir).glob('*.png'):
-        f.unlink()
+    # Get video metadata
+    probe = subprocess.run([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,r_frame_rate,nb_frames",
+        "-of", "json", video_path
+    ], capture_output=True, text=True)
+    import json
+    meta = json.loads(probe.stdout)["streams"][0]
+    width, height = int(meta["width"]), int(meta["height"])
+    fps_num, fps_den = meta["r_frame_rate"].split("/")
+    fps = float(fps_num) / float(fps_den) if float(fps_den) > 0 else 30.0
 
-    print(f"   🖼️  Extracting frames @ {FPS}fps, {FRAME_W}x{FRAME_H} → {frames_dir}")
-    _run_ffmpeg([
-        'ffmpeg', '-y',
-        '-i', video_path,
-        '-vf', f'fps={FPS},scale={FRAME_W}:{FRAME_H}:flags=lanczos',
-        '-q:v', '2',
-        f'{frames_dir}/%06d.png',
-    ])
+    # Load background image if specified
+    bg_image = None
+    if bg_choice not in ("transparent", "white", "black", "green", "blur"):
+        if os.path.exists(bg_choice):
+            bg_image = Image.open(bg_choice).convert("RGB").resize((width, height))
+            bg_image = T.ToTensor()(bg_image).unsqueeze(0)
+            if torch.cuda.is_available():
+                bg_image = bg_image.cuda()
 
-    frame_files = sorted(Path(frames_dir).glob('*.png'))
-    if not frame_files:
-        raise RuntimeError(f'ffmpeg produced no frames in {frames_dir}')
-    print(f"   🖼️  {len(frame_files)} frames to process")
+    # Process frames in batches
+    frame_files = sorted(os.listdir(frames_dir))
+    batch_size = 4 if torch.cuda.is_available() else 1
+    output_frames_dir = str(Path(output_dir) / "frames_output")
+    os.makedirs(output_frames_dir, exist_ok=True)
 
-    # --- RVM inference loop --------------------------------------------------
-    # RVM recurrent state: 4 tensors (r1, r2, r3, r4) — initially None
-    rec: list[Any] = [None, None, None, None]
-    downsample_ratio = 1.0   # full-resolution (1080x1920 fits comfortably in 16GB)
+    rec = [None] * 4  # recurrent states
 
-    with torch.no_grad():
-        for i, frame_file in enumerate(frame_files):
-            frame = load_image_as_tensor(frame_file, device=device)
-            # RVM forward pass; recurrent state updated in-place
-            fgr, pha, *rec = model(frame, *rec, downsample_ratio=downsample_ratio)
-            composite = composite_frame(fgr, pha, background)
-            save_image(composite, os.path.join(matted_dir, f'{i:06d}.png'))
-            if i % 150 == 0:
-                print(f"      …processed {i + 1}/{len(frame_files)} frames")
+    print(f"[bg_remove] Processing {len(frame_files)} frames in batches of {batch_size}...")
 
-    print(f"   🖼️  Composited {len(frame_files)} frames → {matted_dir}")
+    for batch_start in range(0, len(frame_files), batch_size):
+        batch_files = frame_files[batch_start:batch_start + batch_size]
+        batch_tensors = []
+        for f in batch_files:
+            img = Image.open(os.path.join(frames_dir, f)).convert("RGB")
+            batch_tensors.append(T.ToTensor()(img))
+        src = torch.stack(batch_tensors)
+        if torch.cuda.is_available():
+            src = src.cuda()
 
-    # --- Reassemble video with audio -----------------------------------------
-    output_path = os.path.join(output_dir, 'matted_video.mp4')
-    print(f"   🖼️  Reassembling video → {output_path}")
-    _run_ffmpeg([
-        'ffmpeg', '-y',
-        '-framerate', str(FPS),
-        '-i', f'{matted_dir}/%06d.png',
-        '-i', video_path,                       # audio source
-        '-c:v', 'libx264',
-        '-preset', 'medium',
-        '-crf', '18',                            # visually-lossless
-        '-pix_fmt', 'yuv420p',
-        '-r', str(FPS),
-        '-c:a', 'aac', '-b:a', '192k',
-        '-shortest',
-        '-movflags', '+faststart',
-        output_path,
-    ])
+        # Normalize to [-1, 1] (RVM convention)
+        src = src * 2 - 1
+        src = src.unsqueeze(0)  # [1, T, C, H, W]
 
+        with torch.no_grad():
+            fgr, pha, *rec = model(src, *rec, downsample_ratio=0.25)
+
+        # Compose with chosen background
+        fgr = fgr[0]  # [T, C, H, W]
+        pha = pha[0]  # [T, 1, H, W]
+
+        for i, f in enumerate(batch_files):
+            fg = fgr[i].cpu()
+            a = pha[i].cpu()
+
+            if bg_choice == "transparent":
+                # Save as RGBA PNG
+                rgba = torch.cat([fg, a], dim=0)
+                img = T.ToPILImage()(rgba)
+                img.save(os.path.join(output_frames_dir, f.replace(".png", ".png")))
+            elif bg_choice == "white":
+                bg = torch.ones_like(fg)
+                composite = fg * a + bg * (1 - a)
+                T.ToPILImage()(composite).save(os.path.join(output_frames_dir, f))
+            elif bg_choice == "black":
+                bg = torch.zeros_like(fg)
+                composite = fg * a + bg * (1 - a)
+                T.ToPILImage()(composite).save(os.path.join(output_frames_dir, f))
+            elif bg_choice == "green":
+                bg = torch.tensor([0.0, 1.0, 0.0]).view(3, 1, 1).expand_as(fg)
+                composite = fg * a + bg * (1 - a)
+                T.ToPILImage()(composite).save(os.path.join(output_frames_dir, f))
+            elif bg_choice == "blur":
+                # Apply blur to original frame, composite with foreground
+                img = Image.open(os.path.join(frames_dir, f)).convert("RGB").filter(Image.GaussianBlur(radius=20))
+                bg = T.ToTensor()(img)
+                composite = fg * a + bg * (1 - a)
+                T.ToPILImage()(composite).save(os.path.join(output_frames_dir, f))
+            elif bg_image is not None:
+                composite = fg * a + bg_image[0] * (1 - a)
+                T.ToPILImage()(composite).save(os.path.join(output_frames_dir, f))
+            else:
+                # Default to original (passthrough)
+                T.ToPILImage()(fg).save(os.path.join(output_frames_dir, f))
+
+    print(f"[bg_remove] Frames processed. Re-encoding video...")
+
+    # Re-encode frames to video using ffmpeg
+    subprocess.run([
+        "ffmpeg", "-y", "-r", str(fps),
+        "-i", os.path.join(output_frames_dir, "%08d.png"),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+        output_path
+    ], check=True, capture_output=True)
+
+    # Cleanup intermediate frames
+    shutil.rmtree(frames_dir, ignore_errors=True)
+    shutil.rmtree(output_frames_dir, ignore_errors=True)
+
+    print(f"[bg_remove] Done. Output: {output_path} ({os.path.getsize(output_path)} bytes)")
     return output_path
 
 
