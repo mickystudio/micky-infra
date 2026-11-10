@@ -92,68 +92,260 @@ DENTAL_HASHTAGS_AR: list[str] = [
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-def export_multi_platform(
-    video_path: str,
-    platforms: list[str],
-    options: dict,
-    output_dir: str,
-) -> list[dict]:
-    """
-    Export the final video for each requested platform + generate captions
-    and hashtags.
-
+def export_multi_platform(video_path, platforms=None, options=None, output_dir=None):
+    """Export a video to multiple platform-optimized versions.
+    
+    Args:
+        video_path: Path to the source video (edited, color-graded, captioned).
+        platforms: List of platform names. Default: all 5 platforms.
+                   Options: 'tiktok', 'reels', 'shorts', 'feed', 'twitter'.
+        options: Dict of optional overrides:
+            - max_duration: int seconds (truncate longer videos)
+            - bitrate_mult: float (multiplier for video bitrate)
+            - keep_audio: bool (default True)
+        output_dir: Where to save exported files. If None, uses video_path's parent.
+    
     Returns:
-        List of dicts:
-            [{'platform', 'video_path', 'caption', 'hashtags', 'size_mb',
-              'spec': {'resolution', 'fps', 'bitrate_kbps'}}]
+        dict: {
+            "tiktok": {"path": str, "size_bytes": int, "duration_sec": float},
+            "reels": {...},
+            "shorts": {...},
+            "feed": {...},
+            "twitter": {...},
+            "all_files": [list of paths],
+        }
     """
-    outputs: list[dict] = []
+    import os, json, subprocess
+    from pathlib import Path
+
+    if platforms is None:
+        platforms = ["tiktok", "reels", "shorts", "feed", "twitter"]
+    if options is None:
+        options = {}
+    if output_dir is None:
+        output_dir = str(Path(video_path).parent / "exports")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Platform specs
+    PLATFORM_SPECS = {
+        "tiktok": {
+            "name": "TikTok",
+            "aspect": "9:16",
+            "width": 1080,
+            "height": 1920,
+            "max_duration": 60,
+            "video_bitrate": "4M",  # 4 Mbps
+            "audio_bitrate": "128k",
+            "audio_channels": 2,
+            "audio_sample_rate": 48000,
+            "max_size_mb": 50,
+            "fps": 30,
+            "extra_args": ["-pix_fmt", "yuv420p", "-profile:v", "high", "-level", "4.0"],
+            "suffix": "_tiktok_9x16.mp4",
+        },
+        "reels": {
+            "name": "Instagram Reels",
+            "aspect": "9:16",
+            "width": 1080,
+            "height": 1920,
+            "max_duration": 90,
+            "video_bitrate": "4M",
+            "audio_bitrate": "128k",
+            "audio_channels": 2,
+            "audio_sample_rate": 48000,
+            "max_size_mb": 100,
+            "fps": 30,
+            "extra_args": ["-pix_fmt", "yuv420p", "-profile:v", "high", "-level", "4.0"],
+            "suffix": "_reels_9x16.mp4",
+        },
+        "shorts": {
+            "name": "YouTube Shorts",
+            "aspect": "9:16",
+            "width": 1080,
+            "height": 1920,
+            "max_duration": 60,
+            "video_bitrate": "6M",  # YouTube allows higher quality
+            "audio_bitrate": "192k",
+            "audio_channels": 2,
+            "audio_sample_rate": 48000,
+            "max_size_mb": 256,
+            "fps": 60,  # YouTube Shorts supports 60fps
+            "extra_args": ["-pix_fmt", "yuv420p", "-profile:v", "high", "-level", "4.0",
+                          "-movflags", "+faststart"],
+            "suffix": "_shorts_9x16.mp4",
+        },
+        "feed": {
+            "name": "Instagram Feed",
+            "aspect": "1:1",
+            "width": 1080,
+            "height": 1080,
+            "max_duration": 60,
+            "video_bitrate": "3.5M",
+            "audio_bitrate": "128k",
+            "audio_channels": 2,
+            "audio_sample_rate": 48000,
+            "max_size_mb": 100,
+            "fps": 30,
+            "extra_args": ["-pix_fmt", "yuv420p", "-profile:v", "high", "-level", "4.0"],
+            "suffix": "_feed_1x1.mp4",
+        },
+        "twitter": {
+            "name": "Twitter/X",
+            "aspect": "16:9",
+            "width": 1280,
+            "height": 720,
+            "max_duration": 140,
+            "video_bitrate": "5M",
+            "audio_bitrate": "128k",
+            "audio_channels": 2,
+            "audio_sample_rate": 48000,
+            "max_size_mb": 25,  # Strict Twitter limit
+            "fps": 30,
+            "extra_args": ["-pix_fmt", "yuv420p", "-profile:v", "high", "-level", "4.0",
+                          "-movflags", "+faststart"],
+            "suffix": "_twitter_16x9.mp4",
+        },
+    }
+
+    # Get source video info
+    probe = subprocess.run([
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration:stream=width,height,r_frame_rate",
+        "-of", "json", video_path
+    ], capture_output=True, text=True, check=True)
+    src_info = json.loads(probe.stdout)
+    src_duration = float(src_info["format"]["duration"])
+    print(f"[export] Source: {video_path} ({src_duration:.1f}s)")
+
+    # Apply overrides
+    max_duration_override = options.get("max_duration")
+    bitrate_mult = options.get("bitrate_mult", 1.0)
+    keep_audio = options.get("keep_audio", True)
+
+    results = {}
+    all_files = []
 
     for platform in platforms:
-        config = PLATFORM_CONFIGS.get(platform)
-        if not config:
-            print(f"   ⚠️  Unknown platform '{platform}' — skipping")
+        if platform not in PLATFORM_SPECS:
+            print(f"[export] Skipping unknown platform: {platform}")
             continue
 
-        platform_dir = os.path.join(output_dir, platform)
-        os.makedirs(platform_dir, exist_ok=True)
+        spec = PLATFORM_SPECS[platform]
+        output_path = os.path.join(output_dir, Path(video_path).stem + spec["suffix"])
 
-        print(f"   📤 Exporting for {platform} "
-              f"({config['resolution'][0]}x{config['resolution'][1]} "
-              f"@ {config['bitrate_kbps']} kbps)")
+        # Determine final duration
+        max_dur = max_duration_override or spec["max_duration"]
+        final_duration = min(src_duration, max_dur)
+        if src_duration > max_dur:
+            print(f"[export] {platform}: truncating to {max_dur}s")
 
-        video_output = os.path.join(platform_dir, 'reel.mp4')
-        export_for_platform(video_path, video_output, config)
+        # Compute target bitrate (apply multiplier)
+        target_bitrate = spec["video_bitrate"]
+        if bitrate_mult != 1.0:
+            # Parse "4M" -> 4_000_000
+            num = float(target_bitrate[:-1])
+            unit = target_bitrate[-1]
+            mult = {"M": 1_000_000, "K": 1_000, "G": 1_000_000_000}[unit]
+            new_bitrate = int(num * mult * bitrate_mult)
+            target_bitrate = f"{new_bitrate // mult}{unit}"
 
-        caption = generate_caption(platform, options, config)
-        hashtags = generate_hashtags(platform, options, config)
+        # Build ffmpeg filter chain for aspect ratio conversion
+        # Strategy: scale to fit target width, then crop/pad to exact aspect ratio
+        # For 9:16 from 16:9 source: scale to 1080x1920, crop center
+        # For 1:1 from 16:9: scale to fit 1080 width, then crop to 1080 height
+        # For 16:9 from 9:16 source: scale to 1280x720
+        target_w = spec["width"]
+        target_h = spec["height"]
+        target_aspect = target_w / target_h
 
-        size_mb = os.path.getsize(video_output) / (1024 * 1024)
-        outputs.append({
-            'platform': platform,
-            'video_path': video_output,
-            'caption': caption,
-            'hashtags': hashtags,
-            'size_mb': round(size_mb, 2),
-            'within_size_limit': size_mb <= config['max_size_mb'],
-            'spec': {
-                'resolution': f"{config['resolution'][0]}x{config['resolution'][1]}",
-                'fps': config['fps'],
-                'bitrate_kbps': config['bitrate_kbps'],
-                'max_size_mb': config['max_size_mb'],
-            },
-        })
+        # ffmpeg filter: scale + crop + pad
+        filter_chain = (
+            f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+            f"crop={target_w}:{target_h}"
+        )
 
-        # Persist caption + hashtags next to the video for easy upload
-        caption_path = os.path.join(platform_dir, 'caption.txt')
-        with open(caption_path, 'w', encoding='utf-8') as f:
-            f.write(caption)
-            if hashtags:
-                f.write('\n\n' + ' '.join('#' + h for h in hashtags))
-        print(f"      ✅ {platform}: {size_mb:.1f} MB "
-              f"({'OK' if size_mb <= config['max_size_mb'] else 'OVER LIMIT'})")
+        # Build ffmpeg command
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-t", str(final_duration),
+            "-vf", filter_chain,
+            "-r", str(spec["fps"]),
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-b:v", target_bitrate,
+            "-maxrate", target_bitrate,
+            "-bufsize", str(int(target_bitrate[:-1]) * 2) + target_bitrate[-1] if target_bitrate[-1] in "MK" else target_bitrate,
+        ]
 
-    return outputs
+        # Audio
+        if keep_audio:
+            cmd.extend([
+                "-c:a", "aac",
+                "-b:a", spec["audio_bitrate"],
+                "-ac", str(spec["audio_channels"]),
+                "-ar", str(spec["audio_sample_rate"]),
+            ])
+        else:
+            cmd.extend(["-an"])
+
+        # Extra platform-specific args
+        cmd.extend(spec["extra_args"])
+
+        # Output path
+        cmd.append(output_path)
+
+        # Run
+        print(f"[export] {platform}: {target_w}x{target_h}, {spec['fps']}fps, {target_bitrate}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"[export] {platform} FAILED: {result.stderr[-500:]}")
+            continue
+
+        # Verify output
+        out_size = os.path.getsize(output_path)
+        out_size_mb = out_size / (1024 * 1024)
+        size_warning = ""
+        if out_size_mb > spec["max_size_mb"]:
+            size_warning = f" ⚠️ EXCEEDS LIMIT ({out_size_mb:.1f}MB > {spec['max_size_mb']}MB)"
+            # Auto-reduce bitrate and re-encode
+            print(f"[export] {platform}: reducing bitrate to fit size limit...")
+            reduced_bitrate = int(float(target_bitrate[:-1]) * (spec["max_size_mb"] / out_size_mb) * 0.9)
+            cmd[cmd.index("-b:v") + 1] = f"{reduced_bitrate}{target_bitrate[-1]}"
+            cmd[cmd.index("-maxrate") + 1] = f"{reduced_bitrate}{target_bitrate[-1]}"
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                out_size = os.path.getsize(output_path)
+                out_size_mb = out_size / (1024 * 1024)
+                size_warning = f" (re-encoded at {reduced_bitrate}{target_bitrate[-1]} → {out_size_mb:.1f}MB)"
+
+        # Get output duration
+        out_probe = subprocess.run([
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", output_path
+        ], capture_output=True, text=True)
+        out_duration = float(out_probe.stdout.strip()) if out_probe.stdout.strip() else 0
+
+        results[platform] = {
+            "path": output_path,
+            "size_bytes": out_size,
+            "size_mb": round(out_size_mb, 2),
+            "duration_sec": round(out_duration, 2),
+            "dimensions": f"{target_w}x{target_h}",
+            "fps": spec["fps"],
+            "bitrate": target_bitrate,
+            "size_warning": size_warning,
+        }
+        all_files.append(output_path)
+        print(f"[export] {platform} ✓ {out_size_mb:.1f}MB, {out_duration:.1f}s{size_warning}")
+
+    print(f"[export] Done. {len(all_files)}/{len(platforms)} platforms exported.")
+    return {
+        **{p: results[p] for p in platforms if p in results},
+        "all_files": all_files,
+        "total_size_mb": round(sum(r["size_bytes"] for r in results.values()) / (1024 * 1024), 2),
+    }
 
 
 def export_for_platform(
@@ -271,9 +463,15 @@ if __name__ == '__main__':
     if len(sys.argv) < 3:
         print('Usage: multi_export.py <input_video> <output_dir> [platform1,platform2,...]')
         sys.exit(1)
-    plats = sys.argv[3].split(',') if len(sys.argv) > 3 else list(PLATFORM_CONFIGS.keys())
+    plats = (sys.argv[3].split(',') if len(sys.argv) > 3
+             else ["tiktok", "reels", "shorts", "feed", "twitter"])
     results = export_multi_platform(
         sys.argv[1], plats, {'audience': 'patients'}, sys.argv[2]
     )
-    for r in results:
-        print(f"{r['platform']:10s} → {r['video_path']} ({r['size_mb']} MB)")
+    # New return is a dict: {platform -> spec_dict, 'all_files': [...], 'total_size_mb': float}
+    for platform in [p for p in plats if p in results]:
+        r = results[platform]
+        print(f"{platform:10s} → {r['path']} ({r['size_mb']} MB, "
+              f"{r['dimensions']}, {r['duration_sec']}s){r.get('size_warning', '')}")
+    print(f"Total size: {results.get('total_size_mb', 0)} MB across "
+          f"{len(results.get('all_files', []))} files")
