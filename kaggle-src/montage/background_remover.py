@@ -166,6 +166,8 @@ def load_rvm_model(device: str = 'cuda') -> Any:
     Load the Robust Video Matting (resnet50 backbone) model.
 
     Uses torch.hub. The model is cached after first load.
+    Raises RuntimeError if the model cannot be fetched
+    (e.g. no internet on a sandboxed Kaggle kernel).
     """
     _ensure_torch_deps()
     global _RVM_MODEL_CACHE
@@ -173,11 +175,19 @@ def load_rvm_model(device: str = 'cuda') -> Any:
         return _RVM_MODEL_CACHE
 
     print(f"   🖼️  Loading RVM resnet50 model (torch.hub)...")
-    model = torch.hub.load(
-        'PeterL1n/RobustVideoMatting',
-        'resnet50',
-        trust_repo=True,
-    )
+    try:
+        model = torch.hub.load(
+            'PeterL1n/RobustVideoMatting',
+            'resnet50',
+            trust_repo=True,
+        )
+    except Exception as e:
+        raise RuntimeError(
+            "Failed to load Robust Video Matting model from torch.hub. "
+            "This typically requires internet access on first run "
+            "(Kaggle: enable 'Internet' in the kernel settings). "
+            f"Original error: {e}"
+        ) from e
     model = model.to(device).eval()
     _RVM_MODEL_CACHE = model
     return model
@@ -258,3 +268,21 @@ def _run_ffmpeg(cmd: list[str]) -> None:
             f"command: {' '.join(cmd)}\n"
             f"stderr: {result.stderr[-2000:]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Standalone CLI (for debugging)
+# ---------------------------------------------------------------------------
+if __name__ == '__main__':
+    import sys
+
+    if len(sys.argv) < 4:
+        print('Usage: background_remover.py <video_path> <bg_choice> <output_dir>')
+        print("bg_choice options: " + ', '.join(BACKGROUNDS.keys()))
+        sys.exit(1)
+
+    _video = sys.argv[1]
+    _bg = sys.argv[2]
+    _out_dir = sys.argv[3]
+    _result = remove_background(_video, _bg, _out_dir)
+    print(f'Matted video → {_result}')
