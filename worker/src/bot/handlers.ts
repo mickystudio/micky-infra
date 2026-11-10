@@ -690,3 +690,179 @@ function formatBytes(bytes: number): string {
   const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
   return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
 }
+
+// ============ /cancel — Cancel active task or wizard ============
+
+export async function handleCancelCommand(env: Env, chatId: number, taskId?: string): Promise<void> {
+  if (taskId) {
+    // Cancel specific task by ID
+    const task = await env.DB.prepare(
+      'SELECT id, status, runner, runner_job_id FROM tasks WHERE id = ? AND chat_id = ?'
+    ).bind(taskId, String(chatId)).first() as { id: string; status: string; runner: string | null; runner_job_id: string | null } | null;
+
+    if (!task) {
+      await sendTelegramMessage(env, chatId, `❌ لم يتم العثور على مهمة بالمعرّف: \`${taskId}\``);
+      return;
+    }
+
+    if (task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled') {
+      await sendTelegramMessage(env, chatId, `⚠️ المهمة \`${taskId}\` بالفعل في حالة: ${task.status}`);
+      return;
+    }
+
+    // Update task to cancelled
+    await env.DB.prepare(
+      'UPDATE tasks SET status = ?, completed_at = ?, error_log = ? WHERE id = ?'
+    ).bind('cancelled', Date.now() / 1000, 'cancelled by user', taskId).run();
+
+    // If it was on Kaggle, try to stop the kernel
+    if (task.runner === 'kaggle' && task.runner_job_id) {
+      try {
+        const { stopKaggleKernel } = await import('../runners/kaggle_runner');
+        await stopKaggleKernel(env, task.runner_job_id);
+      } catch (e) {
+        console.error('Failed to stop Kaggle kernel:', e);
+      }
+    }
+
+    await sendTelegramMessage(env, chatId, [
+      '🛑 *تم إلغاء المهمة*',
+      '',
+      `🆔 \`${taskId}\``,
+      `📍 الحالة السابقة: ${task.status}`,
+      '✅ تم تحديثها إلى: cancelled',
+      '',
+      task.runner === 'kaggle' && task.runner_job_id ? `🔗 تم إيقاف Kaggle kernel: \`${task.runner_job_id}\`` : '',
+    ].filter(Boolean).join('\n'));
+    return;
+  }
+
+  // No task ID specified — cancel active wizard OR show active tasks
+  const hasWizard = await hasActiveWizard(env, chatId);
+  if (hasWizard) {
+    await handleCancelWizard(env, chatId);
+    return;
+  }
+
+  // List active tasks for this user
+  const tasks = await env.DB.prepare(
+    'SELECT id, type, status, queued_at FROM tasks WHERE chat_id = ? AND status IN (?) ORDER BY queued_at DESC LIMIT 5'
+  ).bind(String(chatId), 'running').all();
+
+  const activeTasks = (tasks.results || []) as Array<{ id: string; type: string; status: string; queued_at: number }>;
+
+  if (activeTasks.length === 0) {
+    await sendTelegramMessage(env, chatId, [
+      '✅ *لا توجد مهام نشطة للإلغاء*',
+      '',
+      'جميع مهامك مكتملة أو ملغاة بالفعل.',
+    ].join('\n'));
+    return;
+  }
+
+  const lines = ['🛑 *مهام نشطة — اختر ما تريد إلغاءه*', ''];
+  for (const t of activeTasks) {
+    const ageMin = Math.floor((Date.now() / 1000 - t.queued_at) / 60);
+    lines.push(`• \`${t.id}\` — ${t.type} (${t.status}, ${ageMin}min ago)`);
+    lines.push(`  /cancel ${t.id}`);
+  }
+  await sendTelegramMessage(env, chatId, lines.join('\n'));
+}
+
+// ============ /settings — User settings ============
+
+export async function handleSettingsCommand(env: Env, chatId: number): Promise<void> {
+  // Fetch user settings from D1
+  let settings: Record<string, unknown> | null = null;
+  try {
+    settings = await env.DB.prepare(
+      'SELECT * FROM settings WHERE user_id = (SELECT id FROM users WHERE chat_id = ?)'
+    ).bind(chatId).first() as Record<string, unknown> | null;
+  } catch (e) {
+    console.error('Settings query failed:', e);
+  }
+
+  const get = (key: string): unknown => (settings as Record<string, unknown> | null)?.[key];
+
+  const lines = [
+    '⚙️ *إعداداتك الحالية*',
+    '',
+    `🌐 اللغة: ${(get('language') as string) || 'ar'}`,
+    `🎨 السمة: ${(get('theme') as string) || 'dark'}`,
+    `🔔 الإشعارات: ${get('notifications') === false ? 'معطّلة' : 'مفعّلة'}`,
+    `🎭 الجمهور الافتراضي: ${(get('default_audience') as string) || 'patients'}`,
+    `🗣️ النبرة الافتراضية: ${(get('default_tone') as string) || 'educational'}`,
+    `🤖 النموذج الافتراضي: ${(get('default_model') as string) || 'qwen2.5-coder-32b'}`,
+    `🌡️ درجة الحرارة: ${(get('temperature') as number) ?? 0.4}`,
+    '',
+    '*للتعديل:*',
+    '/settings lang ar|en — تغيير اللغة',
+    '/settings theme dark|light — تغيير السمة',
+    '/settings notify on|off — تفعيل/إلغاء الإشعارات',
+    '/settings model qwen2.5-coder-32b|14b|7b — تغيير النموذج',
+    '/settings temp 0.0-1.0 — ضبط درجة الحرارة',
+    '',
+    '🔐 /biometric — إعداد البصمة (WebApp)',
+  ];
+  await sendTelegramMessage(env, chatId, lines.join('\n'));
+}
+
+// ============ /biometric — Biometric enrollment (WebApp integration) ============
+
+export async function handleBiometricCommand(env: Env, chatId: number, action?: string): Promise<void> {
+  if (!action || action === 'status') {
+    // Show current biometric enrollment status
+    let enrolled = false;
+    try {
+      const user = await env.DB.prepare(
+        'SELECT biometric_enrolled FROM users WHERE chat_id = ?'
+      ).bind(chatId).first() as { biometric_enrolled?: number } | null;
+      enrolled = (user?.biometric_enrolled ?? 0) === 1;
+    } catch (e) {
+      console.error('Biometric query failed:', e);
+    }
+
+    const lines = [
+      '🔐 *البصمة الحيوية (Biometric)*',
+      '',
+      `الحالة الحالية: ${enrolled ? '✅ مُفعّلة' : '❌ غير مُفعّلة'}`,
+      '',
+      '*ما هي البصمة الحيوية؟*',
+      '• تسجيل دخول سريع عبر بصمة الإصبع / الوجه',
+      '• حماية إضافية لعمليات حساسة (مثل إنشاء API keys)',
+      '• تعمل فقط عبر WebApp (لا يمكن تفعيلها من Telegram مباشرة)',
+      '',
+      '*للتفعيل:*',
+      '1. افتح WebApp: https://micky-canvas.pages.dev',
+      '2. سجّل الدخول بكلمة المرور',
+      '3. اذهب إلى Settings → Security → Enable Biometric',
+      '4. اتبع التعليمات على الشاشة',
+      '',
+      '*للإلغاء:*',
+      '/biometric disable — إزالة البصمة (يلزم إعادة الإعداد لاحقًا)',
+    ];
+    await sendTelegramMessage(env, chatId, lines.join('\n'));
+    return;
+  }
+
+  if (action === 'disable') {
+    try {
+      await env.DB.prepare(
+        'UPDATE users SET biometric_enrolled = 0 WHERE chat_id = ?'
+      ).bind(chatId).run();
+      await sendTelegramMessage(env, chatId, '✅ تم تعطيل البصمة الحيوية بنجاح.');
+    } catch (e) {
+      await sendTelegramMessage(env, chatId, `❌ فشل التعطيل: ${String(e)}`);
+    }
+    return;
+  }
+
+  await sendTelegramMessage(env, chatId, [
+    '❓ أمر غير معروف.',
+    '',
+    'الأوامر المتاحة:',
+    '• /biometric — عرض الحالة',
+    '• /biometric disable — تعطيل البصمة',
+  ].join('\n'));
+}
+
