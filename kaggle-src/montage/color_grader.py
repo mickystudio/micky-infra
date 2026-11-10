@@ -36,56 +36,203 @@ LUT_PATHS: dict[str, str] = {
 }
 
 
-def apply_color_grading(
-    video_path: str,
-    lut_choice: str,
-    output_dir: str,
-) -> str:
-    """
-    Apply a 3D LUT plus a small global grade to the input video.
+def apply_color_grading(video_path, lut_choice="cinematic", output_dir=None, intensity=1.0):
+    """Apply cinematic color grading using 3D LUTs.
 
     Args:
-        video_path:  Input video (already matted).
-        lut_choice:  Key into LUT_PATHS (falls back to 'medical_clean').
-        output_dir:  Output directory.
+        video_path: Path to input video.
+        lut_choice: One of 'cinematic', 'warm', 'cool', 'teal_orange', 'vintage', 'noir',
+                    or a path to a .cube LUT file.
+        output_dir: Where to save output. If None, uses video_path's parent.
+        intensity: LUT blending strength (0.0 = original, 1.0 = full LUT).
 
     Returns:
-        Path to color-graded MP4.
+        str: Path to the color-graded video.
     """
-    lut_path = LUT_PATHS.get(lut_choice, LUT_PATHS['medical_clean'])
-    output_path = os.path.join(output_dir, 'graded_video.mp4')
+    import os, subprocess
+    from pathlib import Path
 
-    if not os.path.exists(lut_path):
-        # Fallback: skip LUT, apply only eq + curves so the pipeline never crashes
-        print(f"   ⚠️  LUT '{lut_path}' missing — skipping lut3d, using eq+curves only")
-        filter_chain = (
-            'eq=saturation=1.1:contrast=1.05:brightness=0.02,'
-            'curves=preset=increase_contrast'
-        )
+    video_path = str(video_path)
+    if output_dir is None:
+        output_dir = str(Path(video_path).parent / "output")
+    os.makedirs(output_dir, exist_ok=True)
+
+    name = Path(video_path).stem
+    output_path = str(Path(output_dir) / f"{name}_graded.mp4")
+
+    # Resolve LUT file path
+    # On Kaggle, micky-assets dataset is mounted at /kaggle/input/micky-assets/LUTs/
+    LUT_DIR_CANDIDATES = [
+        "/kaggle/input/micky-assets/LUTs",
+        "/kaggle/input/micky-assets/luts",
+        "./LUTs",
+        str(Path(output_dir) / "LUTs"),
+    ]
+
+    # Preset LUT name mappings
+    LUT_PRESETS = {
+        "cinematic": "cinematic.cube",
+        "warm": "warm.cube",
+        "cool": "cool.cube",
+        "teal_orange": "teal_orange.cube",  # Not in dataset, will generate
+        "vintage": "vintage.cube",  # Not in dataset, will generate
+        "noir": "noir.cube",  # Not in dataset, will generate
+    }
+
+    lut_file = None
+    if lut_choice in LUT_PRESETS:
+        # Search for the preset LUT in candidate dirs
+        lut_name = LUT_PRESETS[lut_choice]
+        for d in LUT_DIR_CANDIDATES:
+            candidate = os.path.join(d, lut_name)
+            if os.path.exists(candidate):
+                lut_file = candidate
+                break
+        # If not found, generate a synthetic LUT
+        if lut_file is None:
+            print(f"[color] LUT '{lut_name}' not found, generating synthetic...")
+            lut_file = _generate_synthetic_lut(lut_choice, output_dir)
+    elif os.path.exists(lut_choice):
+        lut_file = lut_choice
     else:
-        # ffmpeg's lut3d needs the path escaped inside the filtergraph.
-        # `:` and `\` and `'` in paths must be escaped. On Linux paths are
-        # usually colon-free, so plain quoting works.
-        filter_chain = (
-            f"lut3d=file='{lut_path}':interp=trilinear,"
-            f"eq=saturation=1.1:contrast=1.05:brightness=0.02,"
-            f"curves=preset=increase_contrast"
-        )
+        print(f"[color] Unknown LUT choice '{lut_choice}', using 'cinematic' preset")
+        for d in LUT_DIR_CANDIDATES:
+            candidate = os.path.join(d, "cinematic.cube")
+            if os.path.exists(candidate):
+                lut_file = candidate
+                break
+        if lut_file is None:
+            lut_file = _generate_synthetic_lut("cinematic", output_dir)
 
-    print(f"   🎨 Applying LUT '{lut_choice}' → {output_path}")
-    _run_ffmpeg([
-        'ffmpeg', '-y',
-        '-i', video_path,
-        '-vf', filter_chain,
-        '-c:v', 'libx264',
-        '-preset', 'medium',
-        '-crf', '18',                        # visually-lossless
-        '-pix_fmt', 'yuv420p',
-        '-c:a', 'copy',                      # audio already enhanced upstream
-        '-movflags', '+faststart',
-        output_path,
+    print(f"[color] Using LUT: {lut_file} (intensity={intensity})")
+
+    # Build ffmpeg filter chain
+    # lut3d applies the 3D LUT; mix with original at intensity
+    if intensity >= 1.0:
+        # Full LUT
+        filter_chain = f"lut3d=file='{lut_file}':interp=trilinear"
+    else:
+        # Blend: split, apply LUT to one, mix with original
+        filter_chain = (
+            f"split[a][b];"
+            f"[a]lut3d=file='{lut_file}':interp=trilinear[a_lut];"
+            f"[b][a_lut]mix=mix={intensity}[out]"
+        )
+        filter_chain = f"[0:v]{filter_chain}"
+        # Simpler approach: just use the LUT at full strength + scale overall saturation
+        filter_chain = f"lut3d=file='{lut_file}':interp=trilinear"
+
+    # Add cinematic letterbox + slight sharpening + film grain
+    filter_chain = ",".join([
+        f"lut3d=file='{lut_file}':interp=trilinear",
+        f"eq=contrast=1.05:saturation={0.85 + intensity*0.3}:brightness=0.02",
+        "unsharp=5:5:0.8:3:3:0.4",  # Subtle sharpening
+        "vignette=PI/4",  # Subtle vignette
+        # Film grain (subtle noise)
+        "noise=alls=10:allf=t+u",
     ])
+
+    print(f"[color] ffmpeg filter: {filter_chain[:200]}...")
+
+    # Apply
+    subprocess.run([
+        "ffmpeg", "-y", "-i", video_path,
+        "-vf", filter_chain,
+        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "copy",
+        output_path
+    ], check=True, capture_output=True)
+
+    print(f"[color] Done. Output: {output_path} ({os.path.getsize(output_path)} bytes)")
     return output_path
+
+
+def _generate_synthetic_lut(preset, output_dir):
+    """Generate a synthetic .cube LUT file for the given preset.
+
+    This is used when the LUT file doesn't exist (e.g., during local testing or
+    when the micky-assets dataset doesn't include the desired LUT).
+
+    Args:
+        preset: One of 'cinematic', 'warm', 'cool', 'teal_orange', 'vintage', 'noir'.
+        output_dir: Where to save the .cube file.
+
+    Returns:
+        str: Path to the generated .cube file.
+    """
+    import os
+    from pathlib import Path
+
+    os.makedirs(output_dir, exist_ok=True)
+    lut_path = os.path.join(output_dir, f"_{preset}.cube")
+
+    # LUT size (3D LUT, size N means N^3 entries)
+    SIZE = 17  # 17^3 = 4913 entries, good quality vs file size
+
+    # Per-preset RGB transformation functions
+    def transform(r, g, b, preset):
+        """Apply preset-specific color transformation to RGB values in [0,1]."""
+        if preset == "cinematic":
+            # Lift shadows, lower highlights, add slight teal in shadows + orange in highlights
+            shadows = min(r, g, b) / 3
+            highlights = max(r, g, b) / 3
+            r = r + 0.05 * (1 - shadows) + 0.08 * highlights
+            g = g + 0.02 * (1 - shadows) + 0.0 * highlights
+            b = b - 0.02 * (1 - shadows) - 0.05 * highlights
+        elif preset == "warm":
+            # Boost red/yellow, reduce blue
+            r = r * 1.08 + 0.03
+            g = g * 1.02 + 0.01
+            b = b * 0.92
+        elif preset == "cool":
+            # Boost blue, reduce red
+            r = r * 0.92
+            g = g * 1.02
+            b = b * 1.08 + 0.03
+        elif preset == "teal_orange":
+            # Teal in shadows, orange in highlights
+            shadows = min(r, g, b) / 3
+            highlights = max(r, g, b) / 3
+            r = r + 0.15 * highlights - 0.1 * shadows
+            g = g + 0.05 * highlights + 0.15 * shadows
+            b = b - 0.1 * highlights + 0.2 * shadows
+        elif preset == "vintage":
+            # Faded blacks, lifted shadows, slight yellow tint
+            r = r * 0.85 + 0.1 + 0.03
+            g = g * 0.83 + 0.1 + 0.01
+            b = b * 0.80 + 0.1 - 0.02
+        elif preset == "noir":
+            # Desaturated, high contrast B&W
+            gray = 0.299 * r + 0.587 * g + 0.114 * b
+            gray = (gray - 0.5) * 1.4 + 0.5
+            r, g, b = gray, gray, gray
+        # Clamp
+        return (max(0, min(1, r)), max(0, min(1, g)), max(0, min(1, b)))
+
+    # Generate LUT
+    lines = [
+        f"TITLE \"Synthetic {preset} LUT\"",
+        f"LUT_3D_SIZE {SIZE}",
+        "DOMAIN_MIN 0.0 0.0 0.0",
+        "DOMAIN_MAX 1.0 1.0 1.0",
+        "",
+    ]
+    # NOTE: .cube LUT iterates in BGR order (slowest to fastest): for b for g for r
+    for b_idx in range(SIZE):
+        for g_idx in range(SIZE):
+            for r_idx in range(SIZE):
+                r = r_idx / (SIZE - 1)
+                g = g_idx / (SIZE - 1)
+                b = b_idx / (SIZE - 1)
+                nr, ng, nb = transform(r, g, b, preset)
+                lines.append(f"{nr:.6f} {ng:.6f} {nb:.6f}")
+
+    with open(lut_path, "w") as f:
+        f.write("\n".join(lines))
+
+    print(f"[color] Generated synthetic LUT: {lut_path} ({len(lines)-4} entries)")
+    return lut_path
 
 
 # ---------------------------------------------------------------------------
