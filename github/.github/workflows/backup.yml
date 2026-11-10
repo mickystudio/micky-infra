@@ -1,0 +1,130 @@
+# Micky Assistant Unlimited — Daily Backup
+# Runs at 2 AM UTC daily. Creates:
+#   1. Git bundle of micky-vault (full repo snapshot, can be re-cloned)
+#   2. D1 database export via wrangler (if WRANGLER_TOKEN secret is present)
+#   3. A dated GitHub Release in micky-infra containing both artifacts.
+#
+# Failure mode: if D1 export fails (no token / network), the bundle is still
+# uploaded. The release is created with whatever artifacts succeeded.
+
+name: Daily Backup
+
+on:
+  schedule:
+    - cron: '0 2 * * *'   # 2 AM UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: write   # need to create Releases with assets
+
+concurrency:
+  group: backup-daily
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BACKUP_DATE: ${{ github.run_id }}-$(date -u +%Y%m%d)
+      VAULT_REPO: mickystudio/micky-vault
+    steps:
+      - name: Set backup date
+        run: |
+          echo "BACKUP_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=backup-$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Checkout micky-infra (for scripts)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install wrangler
+        run: npm install -g wrangler@latest
+
+      # ---------- 1. Clone micky-vault + git bundle ----------
+      - name: Create git bundle of micky-vault
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          git clone --mirror "https://x-access-token:${GH_PAT}@github.com/${VAULT_REPO}.git" vault.git
+          BUNDLE_FILE="micky-vault-${BACKUP_DATE}.bundle"
+          git -C vault.git bundle create "../${BUNDLE_FILE}" --all
+          ls -lh "$BUNDLE_FILE"
+          echo "BUNDLE_FILE=$BUNDLE_FILE" >> "$GITHUB_ENV"
+
+      # ---------- 2. Export D1 via wrangler ----------
+      - name: Export D1 database
+        id: d1
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.WRANGLER_TOKEN }}
+        run: |
+          set -uo pipefail
+          DB_NAME="micky-db"
+          DUMP_FILE="micky-db-${BACKUP_DATE}.sql"
+          # wrangler outputs JSON; --local not set so this targets remote D1.
+          npx wrangler d1 export "$DB_NAME" --remote --output="$DUMP_FILE"
+          ls -lh "$DUMP_FILE"
+          echo "dump_file=$DUMP_FILE" >> "$GITHUB_OUTPUT"
+
+      # ---------- 3. Create daily backup Release ----------
+      - name: Create Release with artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "Backup ${{ env.BACKUP_DATE }}"
+          body: |
+            # Daily Backup — ${{ env.BACKUP_DATE }}
+
+            | Artifact | Status |
+            |---|---|
+            | Git bundle (micky-vault) | ✅ |
+            | D1 export (micky-db) | ${{ steps.d1.outcome == 'success' && '✅' || '❌ (check logs)' }} |
+
+            ## Restoration
+            ```bash
+            # Restore git bundle
+            git clone micky-vault-${BACKUP_DATE}.bundle micky-vault-restored
+
+            # Restore D1
+            wrangler d1 execute micky-db --file=micky-db-${BACKUP_DATE}.sql
+            ```
+          files: |
+            ${{ env.BUNDLE_FILE }}
+            ${{ steps.d1.outputs.dump_file }}
+          fail_on_unmatched_files: false
+
+      - name: Cleanup old backups (keep last 30 days)
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          set -uo pipefail
+          CUT_DATE=$(date -u -d '30 days ago' +%Y-%m-%d)
+          echo "Deleting backups older than $CUT_DATE"
+          # Use GitHub CLI to list and delete stale backup tags.
+          gh release list --repo mickystudio/micky-infra --limit 100 \
+            | awk '/^backup-/ {print $3}' \
+            | while read -r tag; do
+                TAG_DATE=${tag#backup-}
+                if [[ "$TAG_DATE" < "$CUT_DATE" ]]; then
+                  echo "Deleting release $tag"
+                  gh release delete "$tag" --repo mickystudio/micky-infra --yes --cleanup-tag || true
+                fi
+              done
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+
+      - name: Summary
+        run: |
+          echo "### Backup Summary — $BACKUP_DATE" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Release tag: \`$RELEASE_TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Git bundle: \`$BUNDLE_FILE\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- D1 export: ${{ steps.d1.outcome == 'success' && format('`{0}`', steps.d1.outputs.dump_file) || 'failed' }}" >> "$GITHUB_STEP_SUMMARY"
