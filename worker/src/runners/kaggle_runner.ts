@@ -60,17 +60,25 @@ export async function dispatchToKaggle(env: Env, task: Task): Promise<string> {
   const kernelSlug = buildKernelSlug(task);
   const kernelCode = buildKernelCode(task);
 
+  // Kaggle REST API expects camelCase field names (verified via kagglesdk 2.2.5).
+  // `text` is the raw Python source for script-type kernels (NOT base64).
+  // `kernelExecutionType: "SAVE_AND_RUN_ALL"` queues an actual GPU session.
   const payload = {
+    slug: `dentistmichaelnabil/${kernelSlug}`,
+    newTitle: `Micky ${task.type} ${task.id}`,
     text: kernelCode,
-    kernel_type: 'script',
-    title: kernelSlug,
     language: 'python',
-    is_private: 'true',
-    enable_gpu: 'true',
-    enable_internet: 'true',
-    dataset_sources: [] as string[],
-    competition_sources: [] as string[],
-    kernel_sources: [] as string[],
+    kernelType: 'script',
+    isPrivate: true,
+    enableGpu: true,
+    enableTpu: false,
+    enableInternet: true,
+    datasetDataSources: ['dentistmichaelnabil/micky-assets'],
+    kernelDataSources: [],
+    competitionDataSources: [],
+    modelDataSources: [],
+    categoryIds: [],
+    kernelExecutionType: 'SAVE_AND_RUN_ALL',
   };
 
   let response: Response;
@@ -94,7 +102,7 @@ export async function dispatchToKaggle(env: Env, task: Task): Promise<string> {
     );
   }
 
-  const data = (await response.json()) as KagglePushResponse;
+  const data = (await response.json()) as KagglePushResponse & { error?: string };
 
   // Kaggle returns ref like "username/kernel-slug" — use it as the kernel id.
   const kernelId = data.ref ?? data.id ?? kernelSlug;
@@ -106,20 +114,26 @@ export async function dispatchToKaggle(env: Env, task: Task): Promise<string> {
 
 /**
  * Check the status of a Kaggle kernel.
+ * Uses GET /api/v1/kernels/status?userName=...&kernelSlug=... (verified working).
  */
 export async function checkKaggleStatus(
   env: Env,
   kernelId: string
 ): Promise<KaggleStatus> {
+  // kernelId looks like "/code/dentistmichaelnabil/micky-montage-abc123"
+  // Split into userName + kernelSlug
+  const parts = kernelId.split('/').filter(Boolean);
+  const userName = parts.length >= 2 ? parts[parts.length - 2] : 'dentistmichaelnabil';
+  const kernelSlug = parts[parts.length - 1] || kernelId;
+
   let response: Response;
   try {
-    response = await fetch(`${KAGGLE_API_BASE}/kernels/status`, {
-      method: 'POST',
+    const url = `${KAGGLE_API_BASE}/kernels/status?userName=${encodeURIComponent(userName)}&kernelSlug=${encodeURIComponent(kernelSlug)}`;
+    response = await fetch(url, {
+      method: 'GET',
       headers: {
         Authorization: `Bearer ${env.KAGGLE_API_TOKEN}`,
-        'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ kernelId }),
     });
   } catch (err) {
     throw new Error(`Kaggle status network error: ${String(err)}`);
@@ -132,7 +146,7 @@ export async function checkKaggleStatus(
     );
   }
 
-  const data = (await response.json()) as KaggleStatusResponse;
+  const data = (await response.json()) as KaggleStatusResponse & { status?: string; failureMessage?: string };
   const status = (data.status ?? '').toLowerCase();
 
   if (status === 'running' || status === 'queue' || status === 'queued') {
@@ -147,20 +161,24 @@ export async function checkKaggleStatus(
 
 /**
  * Get the output files and logs of a completed Kaggle kernel.
+ * Uses GET /api/v1/kernels/output?userName=...&kernelSlug=... (verified working).
  */
 export async function getKaggleOutput(
   env: Env,
   kernelId: string
 ): Promise<KaggleOutput> {
+  const parts = kernelId.split('/').filter(Boolean);
+  const userName = parts.length >= 2 ? parts[parts.length - 2] : 'dentistmichaelnabil';
+  const kernelSlug = parts[parts.length - 1] || kernelId;
+
   let response: Response;
   try {
-    response = await fetch(`${KAGGLE_API_BASE}/kernels/output`, {
-      method: 'POST',
+    const url = `${KAGGLE_API_BASE}/kernels/output?userName=${encodeURIComponent(userName)}&kernelSlug=${encodeURIComponent(kernelSlug)}`;
+    response = await fetch(url, {
+      method: 'GET',
       headers: {
         Authorization: `Bearer ${env.KAGGLE_API_TOKEN}`,
-        'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ kernelId }),
     });
   } catch (err) {
     throw new Error(`Kaggle output network error: ${String(err)}`);
@@ -236,12 +254,26 @@ function buildKernelSlug(task: Task): string {
  * keep the JS template literal simple — only ${...} is interpolated by JS.
  */
 function buildKernelCode(task: Task): string {
-  // Double-stringify: produces a JSON-encoded string literal that Python
-  // can parse as a str containing JSON.
-  const inputSpecPyLiteral = JSON.stringify(JSON.stringify(task.inputSpec));
+  // Single-stringify produces a JSON literal that Python parses as a dict
+  // (valid as long as inputSpec values are str/num/list/dict — JSON booleans
+  // `true`/`false`/`null` would NOT be valid Python; montage specs use only
+  // strings, so this is safe for the current pipeline).
+  const inputSpecPyLiteral = JSON.stringify(task.inputSpec);
   const taskIdPyLiteral = JSON.stringify(task.id);
   const taskTypePyLiteral = JSON.stringify(task.type);
 
+  // NOTE: This kernel is montage-specific. Kaggle User Secrets (TG_BOT_TOKEN,
+  // ADMIN_CHAT_ID, MICKY_WEBHOOK_URL, MICKY_WEBHOOK_SECRET) are injected as
+  // env vars before the kernel runs. The kernel fetches the 7 montage modules
+  // from the public mickystudio/micky-infra GitHub repo at runtime, imports
+  // them, runs the pipeline, sends Telegram progress updates directly via the
+  // Bot API, and POSTs the final result back to the worker webhook.
+  //
+  // Each line below is a single-quoted JS string, so Python f-string `{...}`
+  // interpolation is safe (JS only interpolates `${...}`). Python `\n` in
+  // f-strings is written as `\\n` here so the literal backslash-n lands in the
+  // generated source (otherwise JS would emit a real newline, breaking the
+  // string literal in Python).
   return [
     '# Auto-generated Kaggle kernel for Micky task: ' + task.id,
     '# Type: ' + task.type,
@@ -250,54 +282,79 @@ function buildKernelCode(task: Task): string {
     'import json',
     'import os',
     'import sys',
+    'import traceback',
     'import urllib.request',
+    'import urllib.error',
+    '',
+    '# --- Env vars (Kaggle User Secrets auto-injected) ---',
+    'MICKY_WEBHOOK_URL = os.environ.get("MICKY_WEBHOOK_URL", "")',
+    'MICKY_WEBHOOK_SECRET = os.environ.get("MICKY_WEBHOOK_SECRET", "")',
+    'TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")',
+    'ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")',
     '',
     'TASK_ID = ' + taskIdPyLiteral,
     'TASK_TYPE = ' + taskTypePyLiteral,
     'INPUT_SPEC = ' + inputSpecPyLiteral,
-    'WEBHOOK_URL = os.environ.get("MICKY_WEBHOOK_URL", "")',
-    'WEBHOOK_SECRET = os.environ.get("MICKY_WEBHOOK_SECRET", "")',
+    '',
+    '# --- Modules to fetch from GitHub (mickystudio/micky-infra is public) ---',
+    'GITHUB_BASE = "https://raw.githubusercontent.com/mickystudio/micky-infra/main/kaggle-src/montage"',
+    'MODULES = [',
+    '    "audio_enhancer.py",',
+    '    "background_remover.py",',
+    '    "caption_generator.py",',
+    '    "color_grader.py",',
+    '    "multi_export.py",',
+    '    "remotion_renderer.py",',
+    '    "take_selector.py",',
+    '    "pipeline.py",  # last — depends on the others',
+    ']',
+    '',
+    'MODULES_DIR = "/kaggle/working/modules"',
+    'os.makedirs(MODULES_DIR, exist_ok=True)',
     '',
     '',
-    'def main():',
-    '    spec = json.loads(INPUT_SPEC) if INPUT_SPEC else {}',
-    '    print("Starting task " + TASK_ID + " (" + TASK_TYPE + ")")',
-    '    print("Input spec: " + json.dumps(spec))',
-    '    sys.stdout.flush()',
-    '',
-    '    output_url = ""',
-    '    output_meta = {}',
-    '    status = "completed"',
-    '',
+    'def tg_msg(text):',
+    '    """Send a Telegram message directly via the Bot API."""',
+    '    if not TG_BOT_TOKEN or not ADMIN_CHAT_ID:',
+    '        print("[TG]", text)',
+    '        return',
     '    try:',
-    '        if TASK_TYPE == "montage":',
-    '            output_url, output_meta = run_montage(spec)',
-    '        elif TASK_TYPE == "graphics":',
-    '            output_url, output_meta = run_graphics(spec)',
-    '        else:',
-    '            raise RuntimeError("Unknown task type: " + TASK_TYPE)',
+    '        data = json.dumps({',
+    '            "chat_id": int(ADMIN_CHAT_ID),',
+    '            "text": text,',
+    '            "parse_mode": "Markdown",',
+    '        }).encode("utf-8")',
+    '        req = urllib.request.Request(',
+    '            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",',
+    '            data=data,',
+    '            headers={"Content-Type": "application/json"},',
+    '            method="POST",',
+    '        )',
+    '        urllib.request.urlopen(req, timeout=10).read()',
     '    except Exception as exc:',
-    '        status = "failed"',
-    '        output_meta = {"error": str(exc)}',
-    '        print("Task failed: " + str(exc), file=sys.stderr)',
-    '',
-    '    report_back(status, output_url, output_meta)',
+    '        print(f"[TG failed]: {exc}")',
     '',
     '',
-    'def run_montage(spec):',
-    '    # TODO: implement montage pipeline (RVM + Remotion/FFmpeg)',
-    '    print("Montage pipeline not yet implemented")',
-    '    return "", {}',
-    '',
-    '',
-    'def run_graphics(spec):',
-    '    # TODO: implement graphics pipeline (SDXL)',
-    '    print("Graphics pipeline not yet implemented")',
-    '    return "", {}',
+    'def fetch_module(name):',
+    '    """Fetch a single Python module from GitHub raw URL into MODULES_DIR."""',
+    '    url = f"{GITHUB_BASE}/{name}"',
+    '    dest = os.path.join(MODULES_DIR, name)',
+    '    print(f"Fetching {url}...")',
+    '    req = urllib.request.Request(',
+    '        url,',
+    '        headers={"User-Agent": "MickyKaggleKernel/1.0"},',
+    '    )',
+    '    with urllib.request.urlopen(req, timeout=30) as r:',
+    '        content = r.read()',
+    '    with open(dest, "wb") as f:',
+    '        f.write(content)',
+    '    print(f"  Saved to {dest} ({len(content)} bytes)")',
+    '    return dest',
     '',
     '',
     'def report_back(status, output_url, output_meta):',
-    '    if not WEBHOOK_URL:',
+    '    """POST the final result back to the worker webhook."""',
+    '    if not MICKY_WEBHOOK_URL:',
     '        print("No webhook URL set; skipping report-back")',
     '        return',
     '    payload = json.dumps({',
@@ -307,19 +364,127 @@ function buildKernelCode(task: Task): string {
     '        "output_meta": output_meta,',
     '    }).encode("utf-8")',
     '    req = urllib.request.Request(',
-    '        WEBHOOK_URL,',
+    '        MICKY_WEBHOOK_URL,',
     '        data=payload,',
     '        headers={',
     '            "Content-Type": "application/json",',
-    '            "X-Webhook-Secret": WEBHOOK_SECRET,',
+    '            "X-Webhook-Secret": MICKY_WEBHOOK_SECRET,',
     '        },',
     '        method="POST",',
     '    )',
     '    try:',
     '        with urllib.request.urlopen(req, timeout=30) as resp:',
-    '            print("Webhook response: " + str(resp.status))',
+    '            print(f"Webhook response: {resp.status}")',
     '    except Exception as exc:',
-    '        print("Webhook failed: " + str(exc), file=sys.stderr)',
+    '        print(f"Webhook failed: {exc}", file=sys.stderr)',
+    '',
+    '',
+    'def download_input_video(url, dest_path):',
+    '    """Download the raw input video from a Telegram file URL."""',
+    '    print(f"Downloading input from {url[:80]}...")',
+    '    req = urllib.request.Request(',
+    '        url,',
+    '        headers={"User-Agent": "MickyKaggleKernel/1.0"},',
+    '    )',
+    '    with urllib.request.urlopen(req, timeout=120) as r:',
+    '        with open(dest_path, "wb") as f:',
+    '            f.write(r.read())',
+    '    size = os.path.getsize(dest_path)',
+    '    print(f"  Downloaded {size} bytes")',
+    '    return dest_path',
+    '',
+    '',
+    'def main():',
+    '    print("=== Micky Montage Kernel ===")',
+    '    print(f"Task ID: {TASK_ID}")',
+    '    print(f"Input spec: {json.dumps(INPUT_SPEC, ensure_ascii=False)}")',
+    '    sys.stdout.flush()',
+    '',
+    '    tg_msg(',
+    '        f"🎬 *بدأ معالجة الفيديو*\\n\\n🆔 `{TASK_ID}`\\n⏳ جارٍ تحميل الوحدات..."',
+    '    )',
+    '',
+    '    # Step 1: fetch all modules from GitHub',
+    '    failed_module = None',
+    '    try:',
+    '        for m in MODULES:',
+    '            failed_module = m',
+    '            fetch_module(m)',
+    '    except Exception as exc:',
+    '        msg = f"❌ فشل تحميل الوحدة {failed_module}: {exc}"',
+    '        tg_msg(msg)',
+    '        report_back("failed", "", {"error": msg})',
+    '        return',
+    '',
+    '    sys.path.insert(0, MODULES_DIR)',
+    '',
+    '    # Step 2: import the pipeline module',
+    '    try:',
+    '        import pipeline as montage_pipeline  # noqa: E402',
+    '    except Exception as exc:',
+    '        tb = traceback.format_exc()',
+    '        msg = f"❌ فشل استيراد pipeline: {exc}"',
+    '        tg_msg(msg)',
+    '        report_back("failed", "", {"error": str(exc), "traceback": tb[:1000]})',
+    '        return',
+    '',
+    '    tg_msg("✅ تم تحميل الوحدات. جارٍ تنزيل الفيديو...")',
+    '',
+    '    # Step 3: download input video from INPUT_SPEC.file_url',
+    '    if not isinstance(INPUT_SPEC, dict):',
+    '        msg = "❌ INPUT_SPEC ليس قاموساً صالحاً"',
+    '        tg_msg(msg)',
+    '        report_back("failed", "", {"error": msg})',
+    '        return',
+    '',
+    '    video_url = INPUT_SPEC.get("file_url", "") or ""',
+    '    if not video_url:',
+    '        msg = "❌ لا يوجد file_url في INPUT_SPEC"',
+    '        tg_msg(msg)',
+    '        report_back("failed", "", {"error": msg})',
+    '        return',
+    '',
+    '    input_path = "/kaggle/working/input.mp4"',
+    '    try:',
+    '        download_input_video(video_url, input_path)',
+    '    except Exception as exc:',
+    '        msg = f"❌ فشل تنزيل الفيديو: {exc}"',
+    '        tg_msg(msg)',
+    '        report_back("failed", "", {"error": str(exc)})',
+    '        return',
+    '',
+    '    tg_msg("📥 تم تنزيل الفيديو. جارٍ بدء المعالجة...")',
+    '',
+    '    # Step 4: run the montage pipeline',
+    '    INPUT_SPEC["local_video_path"] = input_path',
+    '    INPUT_SPEC["output_dir"] = "/kaggle/working/output"',
+    '    os.makedirs(INPUT_SPEC["output_dir"], exist_ok=True)',
+    '',
+    '    try:',
+    '        result = montage_pipeline.run_pipeline(INPUT_SPEC)',
+    '    except Exception as exc:',
+    '        tb = traceback.format_exc()',
+    '        msg = f"❌ فشل pipeline: {exc}\\n```\\n{tb[:500]}\\n```"',
+    '        tg_msg(msg)',
+    '        report_back("failed", "", {"error": str(exc), "traceback": tb[:1000]})',
+    '        return',
+    '',
+    '    if not isinstance(result, dict):',
+    '        msg = f"❌ pipeline returned non-dict: {type(result).__name__}"',
+    '        tg_msg(msg)',
+    '        report_back("failed", "", {"error": msg})',
+    '        return',
+    '',
+    '    output_url = result.get("output_url", "") or ""',
+    '    output_meta = result.get("output_meta", {}) or {}',
+    '',
+    '    tg_msg(',
+    '        f"✅ *اكتمل المونتاج بنجاح*\\n\\n📁 الناتج: `{output_url[:60]}...`"',
+    '    )',
+    '',
+    '    # Step 5: report back to worker webhook',
+    '    report_back("completed", output_url, output_meta)',
+    '    print("=== Kernel Complete ===")',
     '',
     '',
     'if __name__ == "__main__":',
