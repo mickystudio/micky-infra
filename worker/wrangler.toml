@@ -63,3 +63,9 @@ TEMPERATURE_DEFAULT = "0.4"
 # - GH_PAT_SCOPED
 # - GH_WEBHOOK_SECRET
 # - KAGGLE_API_TOKEN
+
+# ============ Cron Triggers ============
+# Every 5 minutes, poll Kaggle for running tasks and update their state
+# Implements the scheduled() handler in src/index.ts
+[triggers]
+crons = ["*/5 * * * *"]
