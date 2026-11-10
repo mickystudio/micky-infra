@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="theme-color" content="#0f172a" />
+    <meta name="description" content="Micky Canvas — محرر صور احترافي لطبيب الأسنان" />
+    <title>Micky Canvas | محرر الصور</title>
+
+    <!-- Telegram WebApp SDK (loaded synchronously so window.Telegram.WebApp is ready before React mounts) -->
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+
+    <!-- Cairo + Tajawal Arabic fonts from Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800;900&family=Tajawal:wght@400;500;700;800&display=swap"
+      rel="stylesheet"
+    />
+
+    <style>
+      * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+      html, body, #root {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        width: 100%;
+        background: #0f172a;
+        color: #e2e8f0;
+        font-family: 'Cairo', 'Tajawal', system-ui, -apple-system, sans-serif;
+        overflow: hidden;
+        overscroll-behavior: none;
+      }
+      body { user-select: none; }
+      #root { display: flex; flex-direction: column; }
+      .micky-boot {
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        height: 100%; gap: 14px;
+        font-family: 'Cairo', sans-serif;
+      }
+      .micky-boot .ring {
+        width: 46px; height: 46px; border-radius: 50%;
+        border: 3px solid rgba(255,255,255,0.15);
+        border-top-color: #38bdf8;
+        animation: micky-spin 0.9s linear infinite;
+      }
+      .micky-boot .label { font-size: 14px; color: #94a3b8; letter-spacing: 0.5px; }
+      @keyframes micky-spin { to { transform: rotate(360deg); } }
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <div class="micky-boot">
+        <div class="ring"></div>
+        <div class="label">Micky Canvas · جاري التحميل</div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
