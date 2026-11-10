@@ -292,100 +292,266 @@ async function handleKaggleWebhook(request: Request, env: Env): Promise<Response
 // ============ BYOK: Chat Completions ============
 async function handleChatCompletions(request: Request, env: Env): Promise<Response> {
   // Verify API key (X-API-Key or Authorization Bearer)
+  // Be tolerant: trim whitespace, support both Bearer and lowercase bearer.
   const authHeader = request.headers.get('Authorization') || '';
-  const apiKey = request.headers.get('X-API-Key') || authHeader.replace('Bearer ', '');
-
-  if (!apiKey || !apiKey.startsWith('micky_')) {
-    return json({ error: 'Invalid API key', code: 'invalid_api_key' }, 401);
+  const xApiKey = request.headers.get('X-API-Key') || '';
+  let apiKey = xApiKey;
+  if (!apiKey && authHeader) {
+    // Match "Bearer <key>" case-insensitively, tolerate extra spaces.
+    const m = authHeader.match(/^Bearer\s+(.+)$/i);
+    if (m) apiKey = m[1].trim();
   }
 
-  // Lookup API key in D1
+  if (!apiKey || !apiKey.startsWith('micky_')) {
+    return json({ error: 'Invalid API key. Expected "micky_..." in Authorization: Bearer or X-API-Key header.', code: 'invalid_api_key' }, 401);
+  }
+
+  // Lookup API key in D1 (SHA-256 hash, only non-revoked keys)
   const keyHash = await hashApiKey(apiKey);
-  const keyRecord = await env.DB.prepare(
-    'SELECT * FROM api_keys WHERE key_hash = ? AND revoked = 0'
-  ).bind(keyHash).first();
+  let keyRecord;
+  try {
+    keyRecord = await env.DB.prepare(
+      'SELECT * FROM api_keys WHERE key_hash = ? AND revoked = 0'
+    ).bind(keyHash).first();
+  } catch (dbErr) {
+    console.error('D1 lookup failed:', dbErr);
+    return json({ error: 'Database temporarily unavailable', code: 'db_error' }, 503);
+  }
 
   if (!keyRecord) {
     return json({ error: 'API key not found or revoked', code: 'key_not_found' }, 401);
   }
 
-  // Parse request body
-  const body = await request.json() as ChatCompletionRequest;
-
-  if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
-    return json({ error: 'messages field is required and must be non-empty array' }, 400);
+  // Parse request body (tolerate empty / malformed JSON)
+  let body: ChatCompletionRequest;
+  try {
+    body = await request.json() as ChatCompletionRequest;
+  } catch (e) {
+    return json({ error: 'Invalid JSON in request body', code: 'invalid_json' }, 400);
   }
 
-  // Select model (default: 32B Coder)
+  if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
+    return json({ error: 'messages field is required and must be non-empty array', code: 'invalid_messages' }, 400);
+  }
+
+  // Validate each message has role + content
+  for (let i = 0; i < body.messages.length; i++) {
+    const m = body.messages[i];
+    if (!m.role || !m.content) {
+      return json({ error: `messages[${i}] must have role and content`, code: 'invalid_message_shape' }, 400);
+    }
+    if (!['system', 'user', 'assistant', 'tool'].includes(m.role)) {
+      return json({ error: `messages[${i}].role "${m.role}" is not supported`, code: 'invalid_role' }, 400);
+    }
+  }
+
+  // Select model (default: 32B Coder). Unknown models fall through to default.
   const modelMapping: Record<string, string> = {
     'qwen2.5-coder-32b': env.DEFAULT_MODEL,
     'qwen2.5-coder-14b': env.FAST_MODEL,
     'qwen2.5-coder-7b': '@cf/qwen/qwen2.5-coder-7b-instruct',
+    // Aliases common in BYOK clients
+    'gpt-4': env.DEFAULT_MODEL,
+    'gpt-4o': env.DEFAULT_MODEL,
+    'gpt-3.5-turbo': env.FAST_MODEL,
+    'claude-3-opus': env.DEFAULT_MODEL,
+    'claude-3-sonnet': env.FAST_MODEL,
   };
-  const cfModel = modelMapping[body.model || 'qwen2.5-coder-32b'] || env.DEFAULT_MODEL;
+  const requestedModel = body.model || 'qwen2.5-coder-32b';
+  const cfModel = modelMapping[requestedModel] || env.DEFAULT_MODEL;
 
   // Check rate limits (KV counter)
   const today = new Date().toISOString().split('T')[0];
-  const rateKey = `ratelimit:${keyRecord.id}:${today}`;
-  const current = parseInt(await env.RATE_LIMITS.get(rateKey) || '0', 10);
-  const dailyLimit = 1000; // 1000 requests per day per key
+  const rateKey = `ratelimit:${(keyRecord as { id: string }).id}:${today}`;
+  let current = 0;
+  try {
+    current = parseInt(await env.RATE_LIMITS.get(rateKey) || '0', 10);
+  } catch (e) {
+    // KV read failed — proceed without rate limit check (fail-open)
+    console.error('Rate limit KV read failed:', e);
+  }
+  const dailyLimit = 1000;
   if (current >= dailyLimit) {
-    return json({ error: 'Rate limit exceeded', limit: dailyLimit, used: current }, 429);
+    return json({ error: 'Rate limit exceeded', limit: dailyLimit, used: current, code: 'rate_limited' }, 429);
   }
 
-  // Call Workers AI
-  const aiResponse = await env.AI.run(cfModel, {
-    messages: body.messages,
-    max_tokens: body.max_tokens || parseInt(env.MAX_TOKENS_DEFAULT, 10),
-    temperature: body.temperature ?? parseFloat(env.TEMPERATURE_DEFAULT),
-    top_p: body.top_p || 0.8,
-    stream: body.stream || false,
-  });
-
-  // Increment rate limit
-  await env.RATE_LIMITS.put(rateKey, String(current + 1), { expirationTtl: 86400 });
-
-  // Update last_used
-  await env.DB.prepare('UPDATE api_keys SET last_used = ? WHERE id = ?')
-    .bind(Date.now() / 1000, keyRecord.id as string).run();
-
-  // Log usage
-  await env.DB.prepare(
-    'INSERT INTO system_logs (level, component, message, meta) VALUES (?, ?, ?, ?)'
-  ).bind('info', 'byok', 'chat completion', JSON.stringify({
-    key_id: keyRecord.id,
-    model: body.model,
-    tokens: (aiResponse as { usage?: { total_tokens?: number } }).usage?.total_tokens,
-  })).run();
-
-  // Return OpenAI-compatible response
-  if (body.stream) {
-    const stream = (aiResponse as unknown as ReadableStream);
-    return new Response(stream, {
-      headers: {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-      },
+  // Call Workers AI with graceful error handling
+  let aiResponse: unknown;
+  try {
+    aiResponse = await env.AI.run(cfModel, {
+      messages: body.messages,
+      // Use ?? for top_p/temperature (|| coerces 0 to default, which is wrong)
+      max_tokens: body.max_tokens || parseInt(env.MAX_TOKENS_DEFAULT, 10),
+      temperature: body.temperature ?? parseFloat(env.TEMPERATURE_DEFAULT),
+      top_p: body.top_p ?? 0.8,
+      stream: body.stream === true,
     });
+  } catch (aiErr) {
+    console.error('Workers AI call failed:', aiErr);
+    return json({
+      error: 'Model inference failed',
+      code: 'model_error',
+      message: String(aiErr),
+      // OpenAI-compatible shape
+      type: 'server_error',
+    }, 502);
   }
 
+  // Increment rate limit (best-effort)
+  try {
+    await env.RATE_LIMITS.put(rateKey, String(current + 1), { expirationTtl: 86400 });
+  } catch (e) {
+    console.error('Rate limit KV write failed:', e);
+  }
+
+  // Update last_used (best-effort)
+  try {
+    await env.DB.prepare('UPDATE api_keys SET last_used = ? WHERE id = ?')
+      .bind(Date.now() / 1000, (keyRecord as { id: string }).id).run();
+  } catch (e) {
+    console.error('last_used update failed:', e);
+  }
+
+  // Log usage (best-effort)
+  try {
+    await env.DB.prepare(
+      'INSERT INTO system_logs (level, component, message, meta) VALUES (?, ?, ?, ?)'
+    ).bind('info', 'byok', 'chat completion', JSON.stringify({
+      key_id: (keyRecord as { id: string }).id,
+      model: requestedModel,
+      tokens: (aiResponse as { usage?: { total_tokens?: number } }).usage?.total_tokens,
+    })).run();
+  } catch (e) {
+    console.error('system_logs insert failed:', e);
+  }
+
+  // ============ STREAMING (OpenAI-compatible SSE) ============
+  // Workers AI returns a ReadableStream when stream: true is passed.
+  // We need to transform each chunk from CF format ({response: "..."}) to OpenAI format ({choices:[{delta:{content:"..."}}]}).
+  if (body.stream === true) {
+    const chatId = `chatcmpl-${crypto.randomUUID()}`;
+    const created = Math.floor(Date.now() / 1000);
+
+    // Check if aiResponse is actually a ReadableStream
+    if (aiResponse instanceof ReadableStream) {
+      const transformedStream = aiResponse.pipeThrough(new TransformStream({
+        transform(chunk, controller) {
+          // Workers AI streaming chunks come as JSON strings ending in \n
+          // Some chunks may be partial — buffer them
+          try {
+            const text = typeof chunk === 'string' ? chunk : new TextDecoder().decode(chunk as ArrayBuffer);
+            // Workers AI streams chunks like: data: {"response":"...","usage":{...}}\n\n
+            // OR raw JSON lines: {"response":"..."}\n
+            // Split on newlines and parse each line
+            const lines = text.split('\n');
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (!trimmed) continue;
+              let parsed: { response?: string; usage?: Record<string, unknown> };
+              try {
+                // Strip "data: " prefix if present
+                const jsonStr = trimmed.startsWith('data: ') ? trimmed.slice(6) : trimmed;
+                if (jsonStr === '[DONE]') {
+                  controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+                  continue;
+                }
+                parsed = JSON.parse(jsonStr);
+              } catch {
+                continue; // skip unparseable partial chunks
+              }
+              // Emit OpenAI-compatible SSE chunk
+              const openaiChunk = {
+                id: chatId,
+                object: 'chat.completion.chunk',
+                created,
+                model: requestedModel,
+                choices: [{
+                  index: 0,
+                  delta: { content: parsed.response || '' },
+                  finish_reason: null,
+                }],
+              };
+              controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(openaiChunk)}\n\n`));
+            }
+          } catch (err) {
+            console.error('Stream transform error:', err);
+          }
+        },
+      }));
+
+      return new Response(transformedStream, {
+        headers: {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-transform',
+          'Connection': 'keep-alive',
+          'Access-Control-Allow-Origin': '*',
+        },
+      });
+    } else {
+      // Worker AI returned a non-stream response even though stream: true was requested.
+      // Fall back to non-streaming response with a single chunk.
+      const text = (aiResponse as { response?: string }).response || '';
+      const chunks = text.match(/.{1,3}/g) || [text];
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream({
+        start(controller) {
+          for (const chunk of chunks) {
+            const openaiChunk = {
+              id: chatId,
+              object: 'chat.completion.chunk',
+              created,
+              model: requestedModel,
+              choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }],
+            };
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(openaiChunk)}\n\n`));
+          }
+          // Final chunk with finish_reason: stop + usage
+          const finalChunk = {
+            id: chatId,
+            object: 'chat.completion.chunk',
+            created,
+            model: requestedModel,
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+            usage: (aiResponse as { usage?: Record<string, unknown> }).usage,
+          };
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+        },
+      });
+      return new Response(stream, {
+        headers: {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-transform',
+          'Connection': 'keep-alive',
+          'Access-Control-Allow-Origin': '*',
+        },
+      });
+    }
+  }
+
+  // ============ NON-STREAMING (OpenAI-compatible) ============
+  const aiRes = aiResponse as { response?: string; usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } };
   const response = {
     id: `chatcmpl-${crypto.randomUUID()}`,
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
-    model: body.model || 'qwen2.5-coder-32b',
+    model: requestedModel,
     choices: [
       {
         index: 0,
         message: {
           role: 'assistant',
-          content: (aiResponse as { response: string }).response,
+          content: aiRes.response || '',
         },
         finish_reason: 'stop',
       },
     ],
-    usage: (aiResponse as { usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } }).usage,
+    usage: aiRes.usage || {
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0,
+    },
   };
 
   return json(response);
@@ -854,6 +1020,29 @@ async function processTelegramUpdate(update: TelegramUpdate, env: Env): Promise<
     return;
   }
 
+  // ============ /cancel — Cancel active task ============
+  if (text === '/cancel' || text.startsWith('/cancel ')) {
+    const { handleCancelCommand } = await import('./bot/handlers');
+    const taskId = text.startsWith('/cancel ') ? text.slice(8).trim() : undefined;
+    await handleCancelCommand(env, chatId, taskId);
+    return;
+  }
+
+  // ============ /settings — User settings ============
+  if (text === '/settings') {
+    const { handleSettingsCommand } = await import('./bot/handlers');
+    await handleSettingsCommand(env, chatId);
+    return;
+  }
+
+  // ============ /biometric — Enroll biometric ============
+  if (text === '/biometric' || text.startsWith('/biometric ')) {
+    const { handleBiometricCommand } = await import('./bot/handlers');
+    const action = text.startsWith('/biometric ') ? text.slice(11).trim() : undefined;
+    await handleBiometricCommand(env, chatId, action);
+    return;
+  }
+
   // ============ /projects — Project Management ============
   if (text === '/projects' || text === '/newproject') {
     const { handleProjectsCommand, handleNewProjectCommand } = await import('./bot/handlers');
@@ -869,13 +1058,6 @@ async function processTelegramUpdate(update: TelegramUpdate, env: Env): Promise<
   if (text === '/newkey') {
     const { handleCodeCommand } = await import('./modes/code_mode');
     await handleCodeCommand(env, chatId, 'new');
-    return;
-  }
-
-  // ============ /cancel ============
-  if (text === '/cancel') {
-    const { handleCancelWizard } = await import('./bot/handlers');
-    await handleCancelWizard(env, chatId);
     return;
   }
 
