@@ -1,0 +1,27 @@
+{
+  "name": "micky-remotion",
+  "version": "1.0.0",
+  "description": "Remotion React project for Micky Assistant Montage Mode — Hormozi captions, info cards, progress bars, and dental B-roll.",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "dev": "remotion studio",
+    "render": "remotion render",
+    "render:dynamic": "remotion render DynamicComposition out/DynamicComposition.mp4",
+    "render:caption": "remotion render HormoziCaption out/HormoziCaption.mp4",
+    "build": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@remotion/cli": "^4.0.0",
+    "@remotion/player": "^4.0.0",
+    "lucide-react": "^0.460.0",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0",
+    "remotion": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "typescript": "^5.6.0"
+  }
+}
