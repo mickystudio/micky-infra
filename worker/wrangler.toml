@@ -1,0 +1,65 @@
+# Micky Assistant Unlimited - Cloudflare Worker
+# Main entry point - handles Telegram webhooks + BYOK endpoint
+
+name = "micky-assistant"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Workers.dev subdomain URL: https://micky-assistant.cources01.workers.dev
+
+# ============ D1 Database Binding ============
+[[d1_databases]]
+binding = "DB"
+database_name = "micky-db"
+database_id = "3ef44fc8-fdfd-4844-9708-2ee4f923ece9"
+
+# ============ KV Namespace Bindings ============
+[[kv_namespaces]]
+binding = "LOCKS"
+id = "84e47e8307464e2aa936d99a3f9dcfec"
+
+[[kv_namespaces]]
+binding = "TASK_STATUS"
+id = "499d4206e947421c83a22d0875c12c4b"
+
+[[kv_namespaces]]
+binding = "RATE_LIMITS"
+id = "1e2a870cb5a149d9bbc5d460fc38f4aa"
+
+[[kv_namespaces]]
+binding = "PROMPT_CACHE"
+id = "30b885a9b31f4c749be2431e335dd690"
+
+# ============ Queue Binding ============
+[[queues.producers]]
+binding = "TASKS_QUEUE"
+queue = "micky-tasks-queue"
+
+[[queues.consumers]]
+queue = "micky-tasks-queue"
+max_batch_size = 1
+max_batch_timeout = 5
+
+# ============ Workers AI Binding ============
+[ai]
+binding = "AI"
+
+# ============ Environment Variables ============
+[vars]
+ENVIRONMENT = "production"
+LOG_LEVEL = "info"
+DEFAULT_MODEL = "@cf/qwen/qwen2.5-coder-32b-instruct"
+FAST_MODEL = "@cf/qwen/qwen2.5-coder-14b-instruct"
+WHISPER_MODEL = "@cf/openai/whisper-tiny-en"
+ADMIN_CHAT_ID = "1235548782"
+MAX_TOKENS_DEFAULT = "4096"
+TEMPERATURE_DEFAULT = "0.4"
+
+# Secrets (set via `wrangler secret put`):
+# - TELEGRAM_BOT_TOKEN
+# - TELEGRAM_CHAT_ID_WHITELIST (comma-separated)
+# - MICKY_PASSWORD_HASH (bcrypt)
+# - GH_PAT_SCOPED
+# - GH_WEBHOOK_SECRET
+# - KAGGLE_API_TOKEN
