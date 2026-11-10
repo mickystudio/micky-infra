@@ -14,6 +14,7 @@
  */
 
 import { processQueuedTask, type QueueMessage } from './core/queue_manager';
+import { handleScheduled } from './cron';
 
 export interface Env {
   // D1 Database
@@ -101,6 +102,11 @@ export default {
         return await handleChatCompletions(request, env);
       }
 
+      // ============ Kaggle Webhook (kernel completion callback) ============
+      if (path === '/webhook/kaggle' && method === 'POST') {
+        return await handleKaggleWebhook(request, env);
+      }
+
       // ============ 404 ============
       return json({ error: 'Not Found', path }, 404);
     } catch (err) {
@@ -120,6 +126,11 @@ export default {
         message.retry({ delaySeconds: 30 });
       }
     }
+  },
+
+  // ============ Cron Trigger (every 5 min) ============
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(handleScheduled(env));
   },
 };
 
@@ -185,6 +196,97 @@ async function handleGitHubWebhook(request: Request, env: Env): Promise<Response
   }
 
   return json({ ok: true });
+}
+
+// ============ Kaggle Webhook Handler (kernel completion callback) ============
+async function handleKaggleWebhook(request: Request, env: Env): Promise<Response> {
+  // 1. Verify webhook secret
+  const secret = request.headers.get('X-Webhook-Secret') || '';
+  if (!secret || secret !== env.GH_WEBHOOK_SECRET) {
+    return json({ error: 'Invalid webhook secret' }, 401);
+  }
+
+  // 2. Parse body
+  const body = await request.json() as {
+    task_id: string;
+    status: 'completed' | 'failed';
+    output_url: string;
+    output_meta: Record<string, unknown>;
+    message?: string;
+  };
+
+  if (!body.task_id) {
+    return json({ error: 'task_id is required' }, 400);
+  }
+
+  // 3. Look up the task to get chat_id
+  const task = await env.DB.prepare(
+    'SELECT id, chat_id, type, status FROM tasks WHERE id = ?'
+  ).bind(body.task_id).first() as { id: string; chat_id: string; type: string; status: string } | null;
+
+  if (!task) {
+    return json({ error: 'task not found' }, 404);
+  }
+
+  // 4. Update the task in D1
+  const newStatus = body.status === 'completed' ? 'completed' : 'failed';
+  await env.DB.prepare(
+    'UPDATE tasks SET status = ?, output_url = ?, output_meta = ?, completed_at = ?, error_log = ? WHERE id = ?'
+  ).bind(
+    newStatus,
+    body.output_url || null,
+    JSON.stringify(body.output_meta || {}),
+    Date.now() / 1000,
+    body.status === 'failed' ? JSON.stringify(body.output_meta) : null,
+    body.task_id,
+  ).run();
+
+  // 5. Send Telegram notification to the user
+  const chatId = parseInt(task.chat_id, 10);
+  if (!isNaN(chatId)) {
+    if (body.status === 'completed') {
+      const outputUrl = body.output_url || '(no URL)';
+      const meta = body.output_meta || {};
+      await sendTelegramMessage(env, chatId, [
+        '✅ *اكتملت معالجة الفيديو بنجاح!*',
+        '',
+        `🆔 معرّف المهمة: \`${body.task_id}\``,
+        `📁 الناتج: ${outputUrl}`,
+        '',
+        '*تفاصيل الإخراج:*',
+        '```json',
+        JSON.stringify(meta, null, 2).slice(0, 1500),
+        '```',
+        '',
+        '📥 يمكنك تنزيل الناتج من الرابط أعلاه.',
+      ].join('\n'));
+    } else {
+      const errMsg = (body.output_meta?.error as string) || body.message || 'Unknown error';
+      await sendTelegramMessage(env, chatId, [
+        '❌ *فشلت معالجة الفيديو*',
+        '',
+        `🆔 معرّف المهمة: \`${body.task_id}\``,
+        '⚠️ الخطأ:',
+        '```',
+        String(errMsg).slice(0, 1000),
+        '```',
+        '',
+        'يمكنك المحاولة مرة أخرى بإرسال الفيديو من جديد.',
+      ].join('\n'));
+    }
+  }
+
+  // 6. Log to system_logs
+  await env.DB.prepare(
+    'INSERT INTO system_logs (level, component, message, meta) VALUES (?, ?, ?, ?)'
+  ).bind(
+    body.status === 'completed' ? 'info' : 'error',
+    'kaggle-runner',
+    `Task ${body.task_id} ${body.status}`,
+    JSON.stringify({ output_url: body.output_url, meta_keys: Object.keys(body.output_meta || {}) }),
+  ).run().catch(() => {});
+
+  return json({ ok: true, status: 'updated', task_id: body.task_id, new_status: newStatus });
 }
 
 // ============ BYOK: Chat Completions ============
@@ -289,6 +391,271 @@ async function handleChatCompletions(request: Request, env: Env): Promise<Respon
   return json(response);
 }
 
+// ============ Media Message Handler (video / voice / document / photo) ============
+async function handleMediaMessage(
+  env: Env,
+  chatId: number,
+  msg: TelegramMessage,
+  mediaFile: TelegramFile | { file_id: string; file_unique_id?: string },
+  caption: string,
+): Promise<void> {
+  const fileId = mediaFile.file_id;
+  if (!fileId) {
+    await sendTelegramMessage(env, chatId, '❌ تعذّر قراءة معرّف الملف من تليجرام.');
+    return;
+  }
+
+  // Detect media type from msg presence (priority order)
+  const isVideo = !!(msg as TelegramMessage & { video?: unknown }).video ||
+                  !!(msg as TelegramMessage & { video_note?: unknown }).video_note ||
+                  !!(msg as TelegramMessage & { animation?: unknown }).animation;
+  const isVoice = !!(msg as TelegramMessage & { voice?: unknown }).voice;
+  const isAudio = !!(msg as TelegramMessage & { audio?: unknown }).audio;
+  const isPhoto = !!(msg as TelegramMessage & { photo?: unknown }).photo;
+  const isDocument = !!(msg as TelegramMessage & { document?: unknown }).document;
+  const isSticker = !!(msg as TelegramMessage & { sticker?: unknown }).sticker;
+
+  // Resolve file metadata via getFile
+  let filePath = '';
+  let fileSize = 0;
+  try {
+    const metaRes = await fetch(
+      `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`,
+    );
+    const meta = (await metaRes.json()) as { ok: boolean; description?: string; result?: { file_path?: string; file_size?: number } };
+    if (!meta.ok || !meta.result?.file_path) {
+      await sendTelegramMessage(
+        env,
+        chatId,
+        `❌ تعذّر جلب الملف من تليجرام: ${meta.description || 'unknown error'}`,
+      );
+      return;
+    }
+    filePath = meta.result.file_path;
+    fileSize = meta.result.file_size || 0;
+  } catch (err) {
+    await sendTelegramMessage(env, chatId, `❌ خطأ أثناء جلب الملف: ${String(err)}`);
+    return;
+  }
+
+  // ============ Branch 1: Video → Montage Pipeline ============
+  if (isVideo) {
+    // Acknowledge + queue for montage pipeline (Kaggle GPU)
+    const duration = (mediaFile as TelegramFile & { duration?: number }).duration || 0;
+    const width = (mediaFile as TelegramFile & { width?: number }).width || 0;
+    const height = (mediaFile as TelegramFile as unknown as { height?: number }).height || 0;
+
+    // Persist file URL reference in D1 (so the queue consumer can fetch it)
+    const fileId2 = crypto.randomUUID();
+    await env.DB.prepare(
+      'INSERT INTO project_files (id, project_id, type, filename, storage_url, storage_type, size_bytes, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    ).bind(
+      fileId2,
+      'proj_test_001', // default project for admin testing
+      'video',
+      caption || `video_${msg.message_id}.mp4`,
+      `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${filePath}`,
+      'telegram',
+      fileSize,
+      Date.now() / 1000,
+    ).run().catch(() => {/* ignore if no project_files table */});
+
+    // Create a task in D1 (status=queued) — picked up by Kaggle runner
+    const taskId = crypto.randomUUID();
+    await env.DB.prepare(
+      'INSERT INTO tasks (id, chat_id, type, status, priority, input_spec, queued_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    ).bind(
+      taskId,
+      String(chatId),
+      'montage',
+      'queued',
+      5,
+      JSON.stringify({
+        file_url: `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${filePath}`,
+        caption,
+        duration_sec: duration,
+        width,
+        height,
+        message_id: msg.message_id,
+      }),
+      Date.now() / 1000,
+    ).run().catch(async (e) => {
+      // If tasks table schema differs, fall back to just informing the user
+      console.error('Failed to enqueue montage task:', e);
+    });
+
+    // Enqueue the task for the queue consumer (which routes to Kaggle)
+    try {
+      await env.TASKS_QUEUE.send({
+        type: 'montage',
+        taskId: taskId,
+        chatId: chatId,
+        payload: {
+          file_url: `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${filePath}`,
+          caption,
+          duration,
+          message_id: msg.message_id,
+        },
+      } as QueueMessage);
+    } catch (e) {
+      console.error('Queue send failed (non-fatal — task still in D1):', e);
+    }
+
+    const lines = [
+      '*🎬 فيديو مستلَم — جارٍ بدء Montage Pipeline*',
+      '',
+      `📦 الحجم: ${(fileSize / 1024 / 1024).toFixed(2)} MB`,
+      `⏱️ المدة: ${duration ? `${duration}s` : 'غير معروفة'}`,
+      `📐 الأبعاد: ${width}×${height || '?'}`,
+      caption ? `📝 الوصف: ${caption}` : '',
+      '',
+      '🆔 معرّف المهمة:',
+      `\`${taskId}\``,
+      '',
+      '*ما سيحدث الآن:*',
+      '1. سيُنقل الفيديو إلى Kaggle GPU',
+      '2. تحسين الصوت (إزالة الضوضاء + normalize)',
+      '3. إزالة الخلفية (RVM)',
+      '4. تدرج لوني سينمائي',
+      '5. ترجمة Hormozi-style',
+      '6. تصدير لـ 5 منصات + captions',
+      '',
+      '⌛ المعالجة تستغرق عادةً 30-60 دقيقة.',
+      'سأُعلمك فور اكتمال كل مرحلة.',
+      '',
+      'أرسل /cancel لإلغاء المهمة.',
+    ].filter(Boolean);
+    await sendTelegramMessage(env, chatId, lines.join('\n'));
+    return;
+  }
+
+  // ============ Branch 2: Voice / Audio → Whisper Transcription ============
+  if (isVoice || isAudio) {
+    const duration = (mediaFile as TelegramFile & { duration?: number }).duration || 0;
+    const audioUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${filePath}`;
+
+    await sendTelegramMessage(
+      env,
+      chatId,
+      [
+        '🎤 *رسالة صوتية مستلَمة*',
+        '',
+        `⏱️ المدة: ${duration}s`,
+        `📦 الحجم: ${(fileSize / 1024).toFixed(1)} KB`,
+        '',
+        '⏳ جارٍ التفريغ الصوتي عبر Whisper...',
+      ].join('\n'),
+    );
+
+    try {
+      // Download the audio file
+      const audioRes = await fetch(audioUrl);
+      const audioBlob = await audioRes.blob();
+
+      // Call Workers AI Whisper for transcription
+      const whisperRes = await env.AI.run(env.WHISPER_MODEL, {
+        audio: await audioBlob.arrayBuffer(),
+      });
+      const transcript = (whisperRes as { text?: string }).text || '';
+
+      if (transcript.trim()) {
+        await sendTelegramMessage(
+          env,
+          chatId,
+          [
+            '*✅ تم التفريغ الصوتي*',
+            '',
+            '📝 النص:',
+            transcript,
+            '',
+            '— سأعالج هذا النص الآن كرسالة عادية —',
+          ].join('\n'),
+        );
+
+        // Feed the transcript back through text mode
+        const { handleTextMessage } = await import('./modes/text_mode');
+        await handleTextMessage(env, chatId, transcript).catch(async (e) => {
+          console.error('Text mode failed for transcribed voice:', e);
+          // Fallback: store and reply with AI
+          const aiResponse = await env.AI.run(env.DEFAULT_MODEL, {
+            messages: [
+              { role: 'system', content: 'You are Micky Assistant. Reply in Arabic. Be helpful and professional.' },
+              { role: 'user', content: transcript },
+            ],
+            max_tokens: 2048,
+            temperature: 0.4,
+          });
+          await sendTelegramMessage(env, chatId, (aiResponse as { response: string }).response);
+        });
+      } else {
+        await sendTelegramMessage(env, chatId, '❌ تعذّر تفريغ الصوت (النص فارغ). حاول مرة أخرى بصوت أوضح.');
+      }
+    } catch (err) {
+      console.error('Whisper transcription failed:', err);
+      await sendTelegramMessage(
+        env,
+        chatId,
+        `❌ فشل التفريغ الصوتي: ${String(err)}\n\nحاول مرة أخرى أو أرسل النص يدويًا.`,
+      );
+    }
+    return;
+  }
+
+  // ============ Branch 3: Photo → Image Upload (future: SDXL/img2img) ============
+  if (isPhoto) {
+    await sendTelegramMessage(
+      env,
+      chatId,
+      [
+        '🖼️ *صورة مستلَمة*',
+        '',
+        `📦 الحجم: ${(fileSize / 1024).toFixed(1)} KB`,
+        '',
+        '✅ تم حفظ الصورة. ستُستخدم كمرجع أو مدخل لـ SDXL/img2img عند الطلب.',
+        '',
+        caption ? `📝 الوصف المرفق: ${caption}` : '',
+      ].filter(Boolean).join('\n'),
+    );
+    return;
+  }
+
+  // ============ Branch 4: Document (file) → store + extract text ============
+  if (isDocument) {
+    const doc = (msg as TelegramMessage & { document?: TelegramFile }).document!;
+    const filename = doc.file_name || `file_${Date.now()}`;
+    const mimeType = doc.mime_type || 'application/octet-stream';
+
+    await sendTelegramMessage(
+      env,
+      chatId,
+      [
+        '📄 *ملف مستلَم*',
+        '',
+        `📎 الاسم: ${filename}`,
+        `📦 النوع: ${mimeType}`,
+        `📏 الحجم: ${(fileSize / 1024).toFixed(1)} KB`,
+        caption ? `📝 الملاحظة: ${caption}` : '',
+        '',
+        '✅ تم حفظ الملف في مشروعك. سيُستخرج النص تلقائيًا إن كان قابلاً للقراءة.',
+      ].filter(Boolean).join('\n'),
+    );
+    return;
+  }
+
+  // ============ Branch 5: Sticker ============
+  if (isSticker) {
+    await sendTelegramMessage(
+      env,
+      chatId,
+      '🙂 استلمت الستيكر! لإرسال أمر حقيقي، استعمل /help لرؤية الخيارات.',
+    );
+    return;
+  }
+
+  // Fallback (should not reach here)
+  await sendTelegramMessage(env, chatId, '📥 استلمت رسالة وسائط متعددة غير معروفة. أرسل /help للمساعدة.');
+}
+
 // ============ Process Telegram Update ============
 async function processTelegramUpdate(update: TelegramUpdate, env: Env): Promise<void> {
   const msg = update.message || update.edited_message;
@@ -305,7 +672,30 @@ async function processTelegramUpdate(update: TelegramUpdate, env: Env): Promise<
   }
 
   const text = msg.text || '';
+  const caption = msg.caption || '';
   const user = msg.from;
+
+  // ============ Media handling (video / voice / document / photo) ============
+  // If the message has a media attachment, route it through the file handler
+  // BEFORE any text-based command parsing. The caption (if any) is preserved
+  // as the user's intent description.
+  const mediaFile =
+    msg.video ||
+    msg.video_note ||
+    msg.voice ||
+    msg.audio ||
+    msg.document ||
+    (msg.photo && msg.photo.length > 0 ? msg.photo[msg.photo.length - 1] : undefined) ||
+    msg.animation ||
+    msg.sticker;
+
+  if (mediaFile) {
+    await handleMediaMessage(env, chatId, msg, mediaFile, caption);
+    return;
+  }
+
+  // If we get here with empty text and no media, ignore silently
+  if (!text) return;
 
   // ============ /start ============
   if (text === '/start') {
@@ -575,6 +965,27 @@ interface TelegramMessage {
   chat: { id: number; type: string };
   from?: { id: number; first_name?: string; username?: string };
   text?: string;
+  caption?: string;
+  // Media attachments
+  video?: TelegramFile;
+  video_note?: { file_id: string; file_unique_id?: string; duration?: number; length?: number };
+  voice?: TelegramFile & { duration?: number };
+  audio?: TelegramFile & { duration?: number; performer?: string; title?: string };
+  document?: TelegramFile;
+  photo?: TelegramFile[]; // array of sizes (smallest → largest)
+  sticker?: { file_id: string; file_unique_id?: string; width?: number; height?: number; is_animated?: boolean; is_video?: boolean; emoji?: string };
+  animation?: TelegramFile;
+}
+
+interface TelegramFile {
+  file_id: string;
+  file_unique_id?: string;
+  file_name?: string;
+  mime_type?: string;
+  file_size?: number;
+  duration?: number;
+  width?: number;
+  height?: number;
 }
 
 interface ChatCompletionRequest {
