@@ -378,3 +378,39 @@ def _probe_duration(video_path: str) -> float:
         return float(result.stdout.strip() or 0.0)
     except Exception:
         return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Standalone CLI (for debugging)
+# ---------------------------------------------------------------------------
+if __name__ == '__main__':
+    import sys
+
+    if len(sys.argv) < 3:
+        print('Usage: remotion_renderer.py <video_path> <output_dir> '
+              '[caption_style]')
+        sys.exit(1)
+
+    _video = sys.argv[1]
+    _out_dir = sys.argv[2]
+    _style = sys.argv[3] if len(sys.argv) > 3 else 'hormozi'
+
+    # Minimal captions dict for the smoke test — empty phrases, just style.
+    _captions = {
+        'words': [],
+        'phrases': [],
+        'style': _style,
+        'language': 'ar',
+        'total_duration': 0.0,
+    }
+    _options = {'caption_style': _style}
+
+    try:
+        _result = render_animations(_video, _captions, _options, _out_dir)
+        print(f'Animated video → {_result}')
+    except RuntimeError as _e:
+        # Remotion requires Node + npm. Surface a friendly message if missing.
+        print(f'[ERROR] {_e}')
+        print('Hint: Remotion requires Node.js + npm. Install with '
+              '`apt-get install -y nodejs npm` on Kaggle.')
+        sys.exit(2)
