@@ -1,0 +1,13 @@
+{
+  "id": "dentistmichaelnabil/micky-whisper",
+  "title": "Micky WhisperX Transcription",
+  "code_file": "kernel_notebook.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": []
+}

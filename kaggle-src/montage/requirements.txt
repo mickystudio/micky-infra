@@ -1,0 +1,83 @@
+# Heavy dependencies for the micky-assistant montage pipeline.
+# Auto-installed on first run via try/except ImportError inside
+# scene_detector.py and silence_trimmer.py — this file is for
+# `pip install -r requirements.txt` reproducibility.
+scenedetect>=0.7
+auto-editor>=30.0.1
+
+# --- B3: LLM highlight scorer ----------------------------------------------
+# requests: HTTP client for the OpenAI-compatible Micky gateway
+#           (https://micky-assistant.cources01.workers.dev/v1/chat/completions).
+#           Used by llm_highlight_scorer.LLMHighlightScorer to score each
+#           candidate window on 5 virality dimensions (hook_strength,
+#           content_value, emotional_intensity, payoff_presence, pacing).
+#           Lazy-imported so the module loads even if requests is missing —
+#           the scorer then degrades gracefully to neutral 0.5 scores.
+requests>=2.31
+
+# --- B7: VLM take-selector (Qwen2.5-VL-7B-Instruct) -------------------------
+# transformers>=4.45 adds the Qwen2VL processor + model classes; older
+# versions lack the `Qwen2VLForConditionalGeneration` symbol and v3 will
+# silently fall back to the heuristic-only path.
+# qwen-vl-utils provides `process_vision_info` (image / video loading).
+# accelerate is required by `device_map='auto'` on multi-GPU hosts (Kaggle T4×2).
+# bitsandbytes is optional but enables INT4 quantization if the host has <16GB
+# VRAM (Qwen2.5-VL-7B is ~14GB BF16 — fits comfortably on a single T4 16GB).
+transformers>=4.45
+qwen-vl-utils>=0.0.8
+accelerate>=0.34
+bitsandbytes>=0.43
+
+# --- B5: Kinetic subtitles pipeline (CapCut-style animated ASS) -------------
+# pysubs2 — pure-Python ASS file construction (round-trips override tags).
+# pyonfx  — optional, for advanced KFX effects (per-syllable \pos, splits,
+#           transforms beyond what \kf gives).  Auto-installed on first run;
+#           if unavailable, the kinetic pipeline falls back to \kf-only.
+pysubs2>=1.7.0
+pyonfx>=0.3.0  # optional, for advanced KFX effects
+
+# --- B11: Storyboard checkpoint + rough-cut review ---------------------------
+# Pillow — image grid composition for the storyboard JPG (3-column layout with
+#          per-take labels). StoryboardGenerator._enforce_size_budget()
+#          re-encodes at progressively lower quality until the file is <500 KB
+#          so the Telegram photo always fits within the bot API limit.
+# reportlab — multi-page PDF export for email/Slack review (6 takes per page
+#          with thumbnail + metadata per take). Lazily imported inside
+#          export_storyboard_pdf() so the module loads even when reportlab
+#          is absent (Kaggle CPU-only notebooks).
+Pillow>=10.0
+reportlab>=4.0
+
+# --- B15: Multi-cam sync (audio cross-correlation + clap detection) ---------
+# scipy — used by `multicam_sync.py` for FFT cross-correlation
+#         (`scipy.signal.correlate`) and as a fallback for spectral flux
+#         when librosa is unavailable. Auto-installed on first run if
+#         missing; the multi-cam modules also lazily install numpy/librosa.
+#         Handles up to 60s offset (festival / concert scenarios).
+scipy>=1.11
+librosa>=0.10  # optional, for clap detection (falls back to scipy-only)
+
+# --- B8: Sound design (music + SFX + ducking + LUFS normalize) --------------
+# requests: HTTP client for Jamendo (CC-BY music) + Freesound (CC0 SFX)
+#           APIs. Lazy-imported by sound_designer.py and auto-installed on
+#           first call via _ensure_requests() so the module still loads
+#           without it. Used for streaming track previews + attribution
+#           metadata persistence.
+# mutagen:  Pure-Python audio metadata (ID3/MP4 tags). Used by the B8
+#           sound_designer when ingesting downloaded Jamendo MP3s to
+#           verify track length / BPM tag before mixing. Auto-installed
+#           on first use; if missing, BPM detection falls back to librosa.
+requests>=2.31
+mutagen>=1.47
+
+# --- B10: AI video generation + voice cloning -------------------------------
+# Wan2.1-T2V-1.3B (Apache-2.0, commercial-safe) for B-roll generation, with
+# LTX-Video as a real-time fallback. FLUX.1-schnell (Apache-2.0) for thumbnails.
+# OpenVoice v2 (MIT) for voice cloning; Coqui TTS is a DEV-ONLY fallback
+# (XTTS v2 ships under Coqui Public Model License — non-commercial).
+# Note: transformers, accelerate, bitsandbytes are already pulled in by B7;
+# they are re-listed here so a fresh `pip install -r` of just B10's deps
+# still works on a clean environment.
+diffusers>=0.30
+accelerate>=0.34
+TTS>=0.22  # Coqui TTS as fallback (XTTS v2 — NC license, dev-only)

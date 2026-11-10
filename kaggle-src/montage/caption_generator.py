@@ -1,6 +1,6 @@
 """
-Caption generator (P4-T2 + P4-T6).
-================================
+Caption generator (P4-T2 + P4-T6 + B5 kinetic upgrade).
+=======================================================
 Produces Alex-Hormozi-style word-by-word captions from Whisper's
 word-level timestamps.
 
@@ -9,21 +9,35 @@ Features:
     - Emoji injection for high-impact dental terms
     - Phrase grouping (3–5 words or sentence boundary) for Remotion rendering
     - Arabic-aware: punctuation list includes '،' and '؟'
-    - Three styles supported:
+    - Three legacy styles supported:
         hormozi      → bold yellow text with black stroke, RTL Cairo font
         minimal      → small white text bottom-center
         arabic_bold  → large white text with subtle gradient
+    - Six kinetic (B5) styles via the new KineticCaptionGenerator:
+        bold_pop, karaoke_fill, boxed, clean_lower, hormozi, tiktok_default
+      (see kinetic_captions.py + README_kinetic.md)
 
 Output: captions.json (consumed by remotion_renderer.py)
+        + kinetic.ass (consumed by FFmpeg libass for burn-in)
 
-Created: 2026-11-10
+Created: 2026-11-10  |  B5 kinetic upgrade: 2026-11-12
 """
 from __future__ import annotations
 
 import json
 import os
 import re
+import sys
+from pathlib import Path
 from typing import Any
+
+# Local imports — same package directory (B5 kinetic pipeline)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from kinetic_captions import KineticCaptionGenerator, VALID_STYLES
+    _KINETIC_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _KINETIC_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Dental keyword → emoji map (Arabic + English)
@@ -71,34 +85,22 @@ _STRIP_PUNCT_RE = re.compile(r'[.,!?،؟:";()\[\]{}«»""\']+')
 # Public API
 # ---------------------------------------------------------------------------
 def generate_captions(transcript, style="hormozi", output_dir=".", language="auto"):
-    """Generate Hormozi-style captions from a transcript.
+    """Generate Hormozi-style captions from a transcript (legacy SRT path).
 
     Args:
-        transcript: Either:
-            - dict: result from whisper.transcribe() (with "segments" + "text")
-            - str: plain text transcript (segmentation will be automatic)
-            - list: list of segment dicts [{start, end, text}, ...]
-        style: Caption style. 'hormozi' (default), 'arabic_hormozi', 'podcast', 'minimal'.
+        transcript: dict (whisper result), str (plain text), or list of
+            segment dicts [{start, end, text}, ...].
+        style: 'hormozi', 'arabic_hormozi', 'podcast', or 'minimal'.
         output_dir: Where to save caption files.
-        language: Language code ('en', 'ar', 'auto'). If 'auto', detect from transcript.
+        language: 'en', 'ar', or 'auto'.
 
-    Returns:
-        dict: {
-            "segments": [...],  # list of {start, end, words: [...]}
-            "ass_path": str,   # path to .ass subtitle file (for ffmpeg burn-in)
-            "json_path": str,  # path to .json (for Remotion/animations)
-            "word_count": int,
-        }
+    Returns: {segments, words, ass_path, json_path, word_count}.
     """
     import os, json, re
     from pathlib import Path
 
     os.makedirs(output_dir, exist_ok=True)
-
-    # Normalize transcript input to list of segments
     segments = _normalize_transcript(transcript)
-
-    # Detect language
     if language == "auto":
         language = _detect_language(segments)
     print(f"[caption] Language: {language}, Style: {style}, Segments: {len(segments)}")
@@ -111,58 +113,40 @@ def generate_captions(transcript, style="hormozi", output_dir=".", language="aut
         seg_text = seg.get("text", "").strip()
         if not seg_text:
             continue
-
-        # Split text into words (preserve Arabic + English)
-        words = re.findall(r'[\w\u0600-\u06FF]+|[^\s\w\u0600-\u06FF]', seg_text, re.UNICODE)
-        words = [w for w in words if w.strip()]
-
-        # Distribute timing across words (roughly proportional to word length)
+        # Preserve Arabic + English word boundaries
+        words = [w for w in re.findall(
+            r'[\w\u0600-\u06FF]+|[^\s\w\u0600-\u06FF]', seg_text, re.UNICODE
+        ) if w.strip()]
         total_chars = sum(len(w) for w in words)
         if total_chars == 0:
             continue
-
         current_time = seg_start
         seg_duration = seg_end - seg_start
-
         for word in words:
             word_duration = (len(word) / total_chars) * seg_duration
             word_end = current_time + word_duration
             word_segments.append({
-                "word": word,
-                "start": current_time,
-                "end": word_end,
-                "duration": word_duration,
+                "word": word, "start": current_time,
+                "end": word_end, "duration": word_duration,
             })
             current_time = word_end
 
     print(f"[caption] Total words: {len(word_segments)}")
-
-    # Apply style-specific coloring
     styled_words = _apply_style(word_segments, style, language)
 
-    # Generate .ass subtitle file (for ffmpeg burn-in)
     ass_path = os.path.join(output_dir, "captions.ass")
     _write_ass_file(styled_words, ass_path, style, language)
     print(f"[caption] .ass file: {ass_path}")
 
-    # Generate JSON file (for Remotion / Canvas animations)
     json_path = os.path.join(output_dir, "captions.json")
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "style": style,
-            "language": language,
-            "word_count": len(styled_words),
-            "words": styled_words,
-        }, f, ensure_ascii=False, indent=2)
+        json.dump({"style": style, "language": language,
+                  "word_count": len(styled_words), "words": styled_words},
+                 f, ensure_ascii=False, indent=2)
     print(f"[caption] .json file: {json_path}")
 
-    return {
-        "segments": segments,
-        "words": styled_words,
-        "ass_path": ass_path,
-        "json_path": json_path,
-        "word_count": len(styled_words),
-    }
+    return {"segments": segments, "words": styled_words, "ass_path": ass_path,
+            "json_path": json_path, "word_count": len(styled_words)}
 
 
 def _normalize_transcript(transcript):
@@ -185,11 +169,18 @@ def _normalize_transcript(transcript):
 
 
 def _detect_language(segments):
-    """Detect if transcript is Arabic or English based on character usage."""
+    """Detect if transcript is Arabic or English based on character usage.
+
+    Falls back to inspecting ``words[*].word`` when segments lack a ``text``
+    field (WhisperX word-only output).
+    """
     arabic_chars = 0
     total_chars = 0
     for seg in segments:
         text = seg.get("text", "")
+        if not text and seg.get("words"):
+            # WhisperX word-only output: reconstruct from word list
+            text = " ".join(w.get("word", "") for w in seg["words"])
         for c in text:
             if '\u0600' <= c <= '\u06FF':
                 arabic_chars += 1
@@ -244,19 +235,13 @@ def _apply_style(words, style, language):
 
 
 def _write_ass_file(words, path, style, language):
-    """Write a .ass (Advanced SubStation Alpha) subtitle file with Hormozi styling.
+    """Write a .ass subtitle file with Hormozi styling (legacy SRT path).
 
-    The .ass format supports per-word coloring, positioning, and basic animations
-    via \\fad and \\t (transform) tags.
+    Supports per-word coloring, positioning, and basic animations via
+    \\fad and \\t tags.  Superseded by KineticCaptionGenerator in B5.
     """
-
     # Choose font
-    if language == "ar":
-        font_name = "Cairo"
-        font_size = 80
-    else:
-        font_name = "Anton"
-        font_size = 90
+    font_name, font_size = ("Cairo", 80) if language == "ar" else ("Anton", 90)
 
     # .ass header
     header = f"""[Script Info]
@@ -333,37 +318,23 @@ def group_into_phrases(
     words: list[dict[str, Any]],
     max_words: int = 4,
 ) -> list[dict[str, Any]]:
-    """
-    Group word dicts into phrases. A phrase breaks at:
-        - max_words reached
-        - a phrase-ending punctuation char
-        - a silence gap > 0.6s between consecutive words
-    """
+    """Group word dicts into phrases (max_words / punctuation / >0.6s gap)."""
     phrases: list[dict[str, Any]] = []
     current: list[dict[str, Any]] = []
-
     for w in words:
         current.append(w)
         ends_sentence = any(ch in w['word'] for ch in PHRASE_END_CHARS)
-        is_long_pause = False
-        if len(current) >= 2:
-            gap = w['start'] - current[-2]['end']
-            is_long_pause = gap > 0.6
-
+        is_long_pause = (len(current) >= 2
+                         and (w['start'] - current[-2]['end']) > 0.6)
         if len(current) >= max_words or ends_sentence or is_long_pause:
-            phrases.append({
-                'words': current,
-                'start': current[0]['start'],
-                'end': current[-1]['end'],
-            })
+            phrases.append({'words': current,
+                            'start': current[0]['start'],
+                            'end': current[-1]['end']})
             current = []
-
     if current:
-        phrases.append({
-            'words': current,
-            'start': current[0]['start'],
-            'end': current[-1]['end'],
-        })
+        phrases.append({'words': current,
+                        'start': current[0]['start'],
+                        'end': current[-1]['end']})
 
     return phrases
 
@@ -392,10 +363,112 @@ def _clean_word(word: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# B5: Kinetic captions (CapCut-style animated ASS via libass)
+# ---------------------------------------------------------------------------
+def generate_kinetic_captions(
+    whisperx_result: dict,
+    video_path: str | None = None,
+    output_dir: str = ".",
+    style: str = "auto",
+    language: str = "auto",
+    font_name: str = "Anton",
+    font_size: int = 110,
+    burn_in: bool = True,
+) -> dict:
+    """Generate CapCut-style kinetic captions (B5 upgrade).
+
+    Pipeline: WhisperX → KineticCaptionGenerator.generate_ass (.ass) →
+    optional FFmpeg libass burn-in (.mp4).
+
+    Six styles: bold_pop, karaoke_fill, boxed, clean_lower, hormozi,
+    tiktok_default (see README_kinetic.md).
+
+    Args:
+        whisperx_result: WhisperX dict (segments[*].words[*] or word_segments).
+        video_path: Source video for burn-in (None = .ass only).
+        output_dir: Output directory (created if missing).
+        style: Kinetic style, 'auto' (detect), or legacy hint
+            ('vlog'→bold_pop, 'podcast'→clean_lower, 'promotional'→hormozi).
+        language: 'ar', 'en', or 'auto' (auto switches font to Cairo).
+        font_name / font_size: overrides (Anton → Cairo for Arabic).
+        burn_in: If True and video_path given, also produce burned video.
+
+    Returns: {ass_path, burned_path, style, language, font_name,
+              font_size, word_count, chunk_count}
+    """
+    if not _KINETIC_AVAILABLE:
+        raise RuntimeError(
+            "KineticCaptionGenerator not available — install pysubs2 "
+            "(pip install pysubs2>=1.7.0) or use legacy generate_captions()"
+        )
+    os.makedirs(output_dir, exist_ok=True)
+
+    if language == "auto":
+        language = _detect_language(_normalize_transcript(whisperx_result))
+    print(f"[kinetic] Language: {language}")
+
+    # Style auto-detect + legacy hint mapping
+    if style == "auto":
+        style = KineticCaptionGenerator.detect_style(whisperx_result)
+        print(f"[kinetic] Auto-detected style: {style}")
+    elif style in ("vlog", "vlogger", "casual"):
+        style = "bold_pop"
+    elif style in ("podcast", "interview", "talking_head"):
+        style = "clean_lower"
+    elif style in ("promo", "promotional", "ad", "advertising"):
+        style = "hormozi"
+    elif style not in VALID_STYLES:
+        legacy = {"arabic_hormozi": "hormozi",
+                  "minimal": "clean_lower",
+                  "arabic_bold": "bold_pop"}
+        if style in legacy:
+            print(f"[kinetic] Mapped legacy style {style!r} → {legacy[style]}")
+            style = legacy[style]
+        else:
+            raise ValueError(
+                f"unknown style {style!r}; valid: {sorted(VALID_STYLES)}"
+            )
+
+    if language == "ar" and font_name in ("Anton", "Impact"):
+        font_name = "Cairo"
+    elif not font_name:
+        font_name = "Anton"
+
+    gen = KineticCaptionGenerator(style=style, font_name=font_name,
+                                   font_size=font_size)
+    ass_path = os.path.join(output_dir, "kinetic.ass")
+    gen.generate_ass(whisperx_result, ass_path)
+
+    words = gen.extract_words(whisperx_result)
+    chunks = gen.chunk_words(words)
+    # Reflect the actual font used (may differ from input if Arabic was
+    # auto-detected → switched Anton → Cairo inside generate_ass).
+    from kinetic_captions import is_arabic_text
+    if (is_arabic_text(" ".join(w.word for w in words))
+            and font_name in ("Anton", "Impact")):
+        font_name = "Cairo"
+    print(f"[kinetic] {len(words)} words → {len(chunks)} chunks "
+          f"(style={style}, font={font_name})")
+
+    burned_path: str | None = None
+    if burn_in and video_path:
+        burned_path = os.path.join(output_dir, "kinetic_burned.mp4")
+        try:
+            gen.burn_into_video(video_path, ass_path, burned_path)
+        except Exception as e:
+            print(f"[kinetic] ⚠️  burn-in failed: {e}")
+            burned_path = None
+
+    return {"ass_path": ass_path, "burned_path": burned_path, "style": style,
+            "language": language, "font_name": font_name,
+            "font_size": font_size, "word_count": len(words),
+            "chunk_count": len(chunks)}
+
+
+# ---------------------------------------------------------------------------
 # Standalone CLI (for debugging)
 # ---------------------------------------------------------------------------
 if __name__ == '__main__':
-    import sys
     if len(sys.argv) < 2:
         print('Usage: caption_generator.py <transcript.json> [style] [out_dir]')
         sys.exit(1)
@@ -403,5 +476,14 @@ if __name__ == '__main__':
         t = json.load(f)
     style = sys.argv[2] if len(sys.argv) > 2 else 'hormozi'
     out_dir = sys.argv[3] if len(sys.argv) > 3 else '.'
-    result = generate_captions(t, style, out_dir)
-    print(f'✅ {len(result["words"])} words → captions.json')
+
+    kinetic_styles = VALID_STYLES | {'auto', 'vlog', 'podcast', 'promotional'}
+    if _KINETIC_AVAILABLE and style in kinetic_styles:
+        print('[main] Using kinetic caption pipeline (B5)')
+        result = generate_kinetic_captions(t, None, out_dir, style=style)
+        print(f'✅ {result["word_count"]} words → {result["ass_path"]} '
+              f'(style={result["style"]})')
+    else:
+        print('[main] Using legacy SRT caption pipeline')
+        result = generate_captions(t, style, out_dir)
+        print(f'✅ {len(result["words"])} words → captions.json')

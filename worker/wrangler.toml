@@ -31,6 +31,14 @@ id = "1e2a870cb5a149d9bbc5d460fc38f4aa"
 binding = "PROMPT_CACHE"
 id = "30b885a9b31f4c749be2431e335dd690"
 
+# Brand assets (logos, fonts, intro/outro clips, LUTs) — Task B13.
+# Binary blobs keyed by `{userId}/{assetType}/{uuid}`.  Metadata lives in
+# the `brand_assets` D1 table; the KV namespace only holds the bytes.
+# Created 2026-11-10 via `wrangler kv namespace create BRAND_ASSETS`.
+[[kv_namespaces]]
+binding = "BRAND_ASSETS"
+id = "08167812d2284d34ad745bcd33f248ed"
+
 # ============ Queue Binding ============
 [[queues.producers]]
 binding = "TASKS_QUEUE"
@@ -63,9 +71,27 @@ TEMPERATURE_DEFAULT = "0.4"
 # - GH_PAT_SCOPED
 # - GH_WEBHOOK_SECRET
 # - KAGGLE_API_TOKEN
+#
+# Gateway (Agent A9 — health-check probes need these to validate provider keys):
+# - GROQ_API_KEY         (Groq Cloud free tier)
+# - MISTRAL_API_KEY      (Mistral La Plateforme)
+# - OPENROUTER_API_KEY   (OpenRouter free models)
+# - GEMINI_API_KEY       (Google AI Studio — Gemini Flash)
+#
+# Optional KV namespace for alert rate-limiting (falls back to RATE_LIMITS
+# when not bound — see gateway/alerts.ts pickAlertKv()):
+# [[kv_namespaces]]
+# binding = "PROVIDER_ALERTS"
+# id = "<your-prod-kv-namespace-id>"
 
 # ============ Cron Triggers ============
-# Every 5 minutes, poll Kaggle for running tasks and update their state
-# Implements the scheduled() handler in src/index.ts
+#   '*/5 * * * *'  — Kaggle stale-task safety-net poll (existing, cron.ts).
+#   '*/30 * * * *' — gateway health-check cron (Agent A9, gateway/cron_handler.ts):
+#                   probes every provider, updates is_healthy + circuit_open_until,
+#                   sends Telegram alerts on healthy→down transitions.
+#   '0 0 * * *'    — daily UTC-midnight quota reset (Agent A9): seeds fresh rows
+#                   in provider_quotas for all 11 providers with full daily limits.
+# Implements the scheduled() handler in src/index.ts which delegates to
+# handleScheduled(env, ctx, event.cron) defined in src/cron.ts.
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["*/5 * * * *", "*/30 * * * *", "0 0 * * *"]

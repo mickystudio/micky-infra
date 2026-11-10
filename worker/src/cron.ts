@@ -1,18 +1,25 @@
 /**
  * Micky Assistant - Scheduled Task Poller
  *
- * Triggered by Cloudflare Cron every 5 minutes. Polls Kaggle for the status
- * of all "running" tasks and updates their state if the kernel has finished
- * (without the kernel successfully calling our /webhook/kaggle callback).
+ * Triggered by Cloudflare Cron. Routes the cron trigger to the right handler:
+ *   every 5 min   → Kaggle stale-task safety-net poll (this file).
+ *   every 30 min  → gateway health-check cron (gateway/cron_handler.ts).
+ *   daily midnight → gateway daily-quota reset (gateway/cron_handler.ts).
+ *
+ * The 5-min poll finds tasks stuck in "running" state for >5 min and asks
+ * Kaggle for their real status. If the kernel has finished (complete /
+ * error / cancelled) we update D1 + notify the user via Telegram. If the
+ * kernel is still running or queued, we leave the task alone.
  *
  * This is a SAFETY NET — the primary update path is the kernel's webhook call.
  * See wrangler.toml `[triggers]` section and the `scheduled()` export in
- * src/index.ts which delegates to `handleScheduled(env)` defined here.
+ * src/index.ts which delegates to `handleScheduled(env, ctx, cron)` here.
  */
 
 import type { Env } from './index';
 import { checkKaggleStatus, getKaggleOutput, type KaggleStatus } from './runners/kaggle_runner';
 import { invalidateTaskCache } from './core/state_machine';
+import { dispatchGatewayCron } from './gateway/cron_handler';
 
 // ============ Constants ============
 
@@ -24,10 +31,9 @@ const STALE_RUNNING_THRESHOLD_SECONDS = 5 * 60; // 5 minutes
 /**
  * Cloudflare Cron entry point.
  *
- * Finds every task stuck in the "running" state for more than 5 minutes and
- * asks Kaggle for its real status. If the kernel has finished (complete /
- * error / cancelled) we update D1 + notify the user via Telegram. If the
- * kernel is still running or queued, we leave the task alone.
+ * Dispatches to the gateway cron handler first (health check + daily reset).
+ * If the gateway handled it, returns immediately. Otherwise falls through
+ * to the existing Kaggle stale-task poll (the 5-min safety net).
  *
  * NOTE on state machine: `transitionTask()` enforces `running -> {verifying,
  * failed, cancelled}` — it does NOT allow `running -> completed` directly.
@@ -36,8 +42,17 @@ const STALE_RUNNING_THRESHOLD_SECONDS = 5 * 60; // 5 minutes
  * and call `invalidateTaskCache()` afterwards so the KV cache stays
  * consistent with D1.
  */
-export async function handleScheduled(env: Env): Promise<void> {
-  console.log('[cron] handleScheduled started');
+export async function handleScheduled(
+  env: Env,
+  ctx: ExecutionContext,
+  cron: string,
+): Promise<void> {
+  // Gateway cron jobs (health check, daily reset) take precedence.
+  const handled = await dispatchGatewayCron(cron, env, ctx);
+  if (handled) return;
+
+  // Default: 5-min Kaggle stale-task safety net.
+  console.log(`[cron] handleScheduled started (trigger: ${cron})`);
 
   const staleBefore = Math.floor(Date.now() / 1000) - STALE_RUNNING_THRESHOLD_SECONDS;
 

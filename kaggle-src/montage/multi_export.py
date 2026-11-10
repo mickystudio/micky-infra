@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import traceback
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -455,6 +456,288 @@ def _render_with_bitrate(
             f"ffmpeg export failed for {output_path} (exit {result.returncode}):\n"
             f"stderr: {result.stderr[-1500:]}"
         )
+
+
+# ===========================================================================
+# B12: multi-platform export WITH variant generation
+# ===========================================================================
+# Pro editors don't deliver one master; they deliver 2-3 variants + a
+# platform-adapted master per destination. The ``MultiExporter`` class
+# below adds a new ``export_with_variants(video_path, platforms, variant_count)``
+# method that runs the B12 PlatformAdapter + ABVariantGenerator on top of
+# the legacy ``export_multi_platform`` path.
+#
+# The class is opt-in: existing callers that use ``export_multi_platform``
+# directly keep working unchanged.
+class MultiExporter:
+    """B12 multi-platform exporter with optional A/B variant generation.
+
+    Combines the legacy ``export_multi_platform`` (5-platform size/bitrate
+    optimisation) with the new B12 PlatformAdapter (aspect/pacing smart
+    reframe) and ABVariantGenerator (2-3 A/B variants for client review).
+
+    Usage::
+
+        exporter = MultiExporter()
+        result = exporter.export_with_variants(
+            video_path='/tmp/master.mp4',
+            platforms=['tiktok', 'youtube'],
+            variant_count=2,
+            output_dir='/tmp/out',
+        )
+        # result = {
+        #   'platforms': {'tiktok': {...}, 'youtube': {...}},
+        #   'variants': [{'id','video_path','description','score'}, ...],
+        #   'comparison_image': '/tmp/.../comparison_<hash>.jpg',
+        #   'all_files': [...],
+        # }
+
+    Args:
+        legacy_export: When True (default), also runs the legacy
+            ``export_multi_platform`` for size/bitrate optimisation
+            alongside the new B12 platform-adapted output. Set False to
+            skip the legacy path (faster, but no per-platform size cap).
+        variant_criteria: 'virality' (default) | 'composition' | 'lighting'
+            — used by ABVariantGenerator.pick_best_variant.
+    """
+
+    def __init__(
+        self,
+        legacy_export: bool = True,
+        variant_criteria: str = 'virality',
+    ) -> None:
+        self.legacy_export = bool(legacy_export)
+        self.variant_criteria = str(variant_criteria)
+        # Lazy-import so missing modules never break construction.
+        self._adapter_cls = None
+        self._variant_cls = None
+        try:
+            from platform_adapter import PlatformAdapter  # type: ignore
+            self._adapter_cls = PlatformAdapter
+        except Exception as e:  # pragma: no cover
+            print(f"[multi_export] PlatformAdapter unavailable ({e}).")
+        try:
+            from ab_variant_generator import ABVariantGenerator  # type: ignore
+            self._variant_cls = ABVariantGenerator
+        except Exception as e:  # pragma: no cover
+            print(f"[multi_export] ABVariantGenerator unavailable ({e}).")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def export_with_variants(
+        self,
+        video_path: str,
+        platforms: list[str] | None = None,
+        variant_count: int = 1,
+        output_dir: str | None = None,
+        takes: list | None = None,
+        beat_times: list[float] | None = None,
+        options: dict | None = None,
+    ) -> dict:
+        """Multi-platform export + optional A/B variant generation.
+
+        Pipeline:
+            1. (optional) Legacy ``export_multi_platform`` per-platform
+               size/bitrate optimisation (5-platform path).
+            2. For each platform in ``platforms``, run PlatformAdapter
+               to smart-reframe, trim, re-pace, and re-encode the video.
+            3. If ``variant_count > 1``, generate N variants of the
+               PRIMARY platform's adapted video via ABVariantGenerator.
+
+        Args:
+            video_path: Source master MP4 (post-Stage-9).
+            platforms: B12 platform names. Default ['tiktok']. Choose from
+                'tiktok','youtube','reels','shorts','square','landscape'.
+            variant_count: 1 (default, off) | 2 | 3 (max).
+            output_dir: Where to drop outputs (default: <video dir>/exports).
+            takes: Optional list of B1 ``Take`` objects — used by
+                PlatformAdapter to pick the highest-scored segments when
+                the master exceeds the platform's max_duration.
+            beat_times: Optional music beat times (seconds) for pacing.
+            options: Optional dict (audience, language, caption_style…).
+
+        Returns:
+            dict with keys: ``platforms``, ``variants``, ``comparison_image``,
+            ``all_files``, ``total_size_mb``.
+        """
+        import os
+        from pathlib import Path
+
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(video_path)
+
+        platforms = platforms or ['tiktok']
+        # Clamp variant_count to [1, 3] — 1 = off.
+        variant_count = max(1, min(3, int(variant_count)))
+        if output_dir is None:
+            output_dir = str(Path(video_path).parent / 'exports')
+        os.makedirs(output_dir, exist_ok=True)
+        options = options or {}
+
+        all_files: list[str] = []
+        platform_results: dict[str, dict] = {}
+        variant_results: list[dict] = []
+        comparison_image: str = ''
+
+        # ---- Step 1: legacy multi_export (size/bitrate optimisation) -----
+        legacy_results: dict = {}
+        if self.legacy_export:
+            try:
+                # Map B12 platform names → legacy names where possible.
+                legacy_plats = self._map_to_legacy_platforms(platforms)
+                if legacy_plats:
+                    legacy_results = export_multi_platform(
+                        video_path, legacy_plats, options, output_dir,
+                    ) or {}
+                    for p, r in legacy_results.items():
+                        if isinstance(r, dict) and r.get('path'):
+                            all_files.append(r['path'])
+            except Exception as e:
+                print(f"[multi_export] legacy export_multi_platform failed ({e}).")
+
+        # ---- Step 2: B12 PlatformAdapter per-platform adaptation -------
+        if self._adapter_cls is not None:
+            for plat in platforms:
+                try:
+                    adapter = self._adapter_cls(plat)
+                    plat_out = os.path.join(
+                        output_dir,
+                        f"{Path(video_path).stem}_{plat}_b12.mp4",
+                    )
+                    adapted_path = adapter.adapt_video(
+                        video_path,
+                        takes=takes,
+                        beat_times=beat_times,
+                        output_path=plat_out,
+                    )
+                    meta = adapter.get_platform_metadata()
+                    # Generate platform-tuned caption via micky gateway.
+                    caption = ''
+                    try:
+                        transcript = options.get('transcript_text', '') \
+                            or options.get('transcript', '')
+                        if transcript:
+                            caption = adapter.generate_caption_for_platform(
+                                transcript, plat)
+                    except Exception as cap_err:
+                        print(f"[multi_export] caption gen for {plat} "
+                              f"failed ({cap_err}).")
+                    platform_results[plat] = {
+                        'video_path': adapted_path,
+                        'caption': caption,
+                        'metadata': meta,
+                        'size_mb': round(
+                            os.path.getsize(adapted_path) / (1024 * 1024), 2
+                        ) if os.path.exists(adapted_path) else 0.0,
+                    }
+                    if os.path.exists(adapted_path):
+                        all_files.append(adapted_path)
+                    print(f"[multi_export] B12 {plat}: → {adapted_path}")
+                except Exception as e:
+                    print(f"[multi_export] B12 platform {plat} failed ({e}).")
+                    traceback.print_exc()
+        else:
+            print("[multi_export] PlatformAdapter unavailable; skipping B12 stage.")
+
+        # ---- Step 3: A/B variants for primary platform -----------------
+        primary_platform = platforms[0] if platforms else 'tiktok'
+        if variant_count > 1 and self._variant_cls is not None:
+            try:
+                # Variant base = the B12-adapted primary platform video
+                # (or the master if B12 was unavailable).
+                base = (platform_results.get(primary_platform, {}).get('video_path')
+                        or video_path)
+                if not os.path.exists(base):
+                    base = video_path
+                variants_dir = os.path.join(output_dir, 'variants')
+                gen = self._variant_cls(
+                    base_video=base,
+                    scene_boundaries=options.get('scene_boundaries') or [],
+                    whisperx_result=options.get('whisperx_result') or {},
+                    beat_times=beat_times,
+                    output_dir=variants_dir,
+                )
+                variants = gen.generate_variants(count=variant_count)
+                best = None
+                try:
+                    best = gen.pick_best_variant(
+                        variants, criteria=self.variant_criteria,
+                    )
+                except Exception as e:
+                    print(f"[multi_export] pick_best_variant failed ({e}).")
+                try:
+                    cmp_meta = gen.compare_variants(variants)
+                    comparison_image = cmp_meta.get('path', '')
+                    if comparison_image and os.path.exists(comparison_image):
+                        all_files.append(comparison_image)
+                except Exception as e:
+                    print(f"[multi_export] compare_variants failed ({e}).")
+                for v in variants:
+                    variant_results.append({
+                        'id': v.id,
+                        'description': v.description,
+                        'video_path': v.video_path,
+                        'parameters_used': v.parameters_used,
+                        'score': v.score,
+                        'is_best': (best is not None and v.id == best.id),
+                    })
+                    if os.path.exists(v.video_path):
+                        all_files.append(v.video_path)
+                print(f"[multi_export] {len(variant_results)} variants generated; "
+                      f"best={best.id if best else 'n/a'}")
+            except Exception as e:
+                print(f"[multi_export] variant generation failed ({e}).")
+                traceback.print_exc()
+        elif variant_count > 1 and self._variant_cls is None:
+            print("[multi_export] variant_count>1 but ABVariantGenerator "
+                  "unavailable; skipping variants.")
+
+        total_size_mb = round(
+            sum(os.path.getsize(f) / (1024 * 1024) for f in all_files
+                if os.path.exists(f)), 2)
+        return {
+            'platforms': platform_results,
+            'legacy': legacy_results,
+            'variants': variant_results,
+            'comparison_image': comparison_image,
+            'best_variant_id': (
+                next((v['id'] for v in variant_results if v.get('is_best')), None)
+                if variant_results else None
+            ),
+            'all_files': all_files,
+            'total_size_mb': total_size_mb,
+        }
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _map_to_legacy_platforms(platforms: list[str]) -> list[str]:
+        """Map B12 platform names → legacy multi_export platform names.
+
+        Legacy multi_export.py supports: tiktok, reels, shorts, feed,
+        twitter, instagram, youtube, facebook, whatsapp. We forward any
+        platform name that already matches a legacy key, and map a few
+        B12 names that don't (square → feed, landscape → feed).
+        """
+        legacy_keys = {
+            'tiktok', 'reels', 'shorts', 'feed', 'twitter',
+            'instagram', 'youtube', 'facebook', 'whatsapp',
+        }
+        out: list[str] = []
+        for p in platforms:
+            if p in legacy_keys:
+                if p not in out:
+                    out.append(p)
+            elif p == 'square':
+                if 'feed' not in out:
+                    out.append('feed')
+            elif p == 'landscape':
+                # No legacy 16:9 target — use youtube (also 1080p+).
+                if 'youtube' not in out:
+                    out.append('youtube')
+        return out
 
 
 if __name__ == '__main__':

@@ -373,37 +373,126 @@ def _probe_duration(video_path: str) -> float:
         return 0.0
 
 
+# B14: parallel rendering via ParallelRenderer
 # ---------------------------------------------------------------------------
-# Standalone CLI (for debugging)
-# ---------------------------------------------------------------------------
-if __name__ == '__main__':
-    import sys
+def _render_segment_with_remotion(segment, source_video: str, output_path: str) -> str:
+    """Per-segment render: trim → Remotion overlay → mux. Idempotent."""
+    import os as _os
+    import shutil as _sh
+    import tempfile as _tf
 
-    if len(sys.argv) < 3:
-        print('Usage: remotion_renderer.py <video_path> <output_dir> '
-              '[caption_style]')
-        sys.exit(1)
+    _os.makedirs(_os.path.dirname(output_path) or '.', exist_ok=True)
+    tmp_dir = _tf.mkdtemp(prefix='remotion_seg_')
+    trimmed = _os.path.join(tmp_dir, f'trim_{segment.segment_idx:03d}.mp4')
+    try:
+        subprocess.run(
+            ['ffmpeg', '-y', '-ss', f'{segment.start_sec:.3f}',
+             '-to', f'{segment.end_sec:.3f}', '-i', source_video,
+             '-c', 'copy', '-avoid_negative_ts', 'make_zero', trimmed],
+            check=True, capture_output=True,
+        )
+    except Exception:
+        # If stream copy fails (e.g. B-frames), re-encode.
+        subprocess.run(
+            ['ffmpeg', '-y', '-ss', f'{segment.start_sec:.3f}',
+             '-to', f'{segment.end_sec:.3f}', '-i', source_video,
+             '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+             '-c:a', 'copy', trimmed],
+            check=True, capture_output=True,
+        )
+    # Render Remotion overlay on the trimmed clip (captions/options from segment.metadata).
+    seg_captions = segment.metadata.get('captions', {'words': [], 'phrases': []})
+    seg_options = segment.metadata.get('options', {})
+    try:
+        rendered = render_animations(trimmed, seg_captions, seg_options, tmp_dir)
+        _sh.copy2(rendered, output_path)
+    except Exception:
+        _sh.copy2(trimmed, output_path)  # Remotion failed → use trimmed clip.
+    finally:
+        _sh.rmtree(tmp_dir, ignore_errors=True)
+    return output_path
 
-    _video = sys.argv[1]
-    _out_dir = sys.argv[2]
-    _style = sys.argv[3] if len(sys.argv) > 3 else 'hormozi'
 
-    # Minimal captions dict for the smoke test — empty phrases, just style.
-    _captions = {
-        'words': [],
-        'phrases': [],
-        'style': _style,
-        'language': 'ar',
-        'total_duration': 0.0,
-    }
-    _options = {'caption_style': _style}
+def render_parallel(
+    video_path: str,
+    captions: dict | str,
+    options: dict | None = None,
+    output_dir: str | None = None,
+    scene_boundaries: list | None = None,
+    segment_count: int = 4,
+) -> str:
+    """B14: parallel-render the Remotion overlay. Falls back to single-thread."""
+    import os as _os
+    from parallel_renderer import ParallelRenderer, Segment, SceneBoundary  # type: ignore
+
+    if options is None:
+        options = {}
+    if output_dir is None:
+        output_dir = str(Path(video_path).parent / 'remotion_parallel_out')
+    _os.makedirs(output_dir, exist_ok=True)
+    final_output = str(Path(output_dir) / f'{Path(video_path).stem}_animated.mp4')
+
+    # Convert SceneBoundary dicts → dataclass instances if needed.
+    boundaries: list = []
+    for b in (scene_boundaries or []):
+        if isinstance(b, SceneBoundary):
+            boundaries.append(b)
+        elif isinstance(b, dict):
+            boundaries.append(SceneBoundary(
+                index=b.get('index', 0), start_time=b.get('start_time', 0.0),
+                end_time=b.get('end_time', 0.0),
+                start_frame=b.get('start_frame', 0),
+                end_frame=b.get('end_frame', 0),
+            ))
+
+    # Inject captions/options into each Segment's metadata before rendering.
+    def _seg_fn(seg: Segment, src: str, out: str) -> str:
+        seg.metadata.setdefault('captions', captions if isinstance(captions, dict)
+                                else {'words': [], 'phrases': []})
+        seg.metadata.setdefault('options', options)
+        return _render_segment_with_remotion(seg, src, out)
 
     try:
-        _result = render_animations(_video, _captions, _options, _out_dir)
-        print(f'Animated video → {_result}')
+        renderer = ParallelRenderer(segment_count=segment_count, output_dir=output_dir)
+        return renderer.parallel_render_video(
+            video_path, boundaries, _seg_fn, final_output,
+        )
+    except Exception as e:
+        print(f'[remotion/parallel] failed ({e}); falling back to single-thread.')
+        return render_animations(video_path, captions, options, output_dir)
+
+
+if __name__ == '__main__':
+    import argparse, sys
+
+    p = argparse.ArgumentParser(description='Remotion renderer (single or parallel)')
+    p.add_argument('video_path', help='Path to source video')
+    p.add_argument('output_dir', help='Output directory')
+    p.add_argument('--caption-style', default='hormozi')
+    p.add_argument('--parallel', action='store_true', help='Use B14 parallel rendering')
+    p.add_argument('--segments', type=int, default=4, help='Parallel segment count (default 4)')
+    p.add_argument('--benchmark', action='store_true', help='Run N=1,2,4,8 benchmark')
+    args = p.parse_args()
+
+    _captions = {'words': [], 'phrases': [], 'style': args.caption_style,
+                 'language': 'ar', 'total_duration': 0.0}
+    _options = {'caption_style': args.caption_style}
+
+    try:
+        if args.benchmark:
+            from parallel_renderer import ParallelRenderer  # type: ignore
+            import json as _json
+            r = ParallelRenderer(segment_count=4, output_dir=args.output_dir)
+            print(_json.dumps(r.benchmark_parallelism(args.video_path), indent=2))
+        elif args.parallel:
+            out = render_parallel(args.video_path, _captions, _options,
+                                  args.output_dir, segment_count=args.segments)
+            print(f'Animated video (parallel) → {out}')
+        else:
+            out = render_animations(args.video_path, _captions, _options, args.output_dir)
+            print(f'Animated video → {out}')
     except RuntimeError as _e:
-        # Remotion requires Node + npm. Surface a friendly message if missing.
         print(f'[ERROR] {_e}')
-        print('Hint: Remotion requires Node.js + npm. Install with '
-              '`apt-get install -y nodejs npm` on Kaggle.')
+        print('Hint: Remotion requires Node.js + npm. '
+              'Install with `apt-get install -y nodejs npm` on Kaggle.')
         sys.exit(2)

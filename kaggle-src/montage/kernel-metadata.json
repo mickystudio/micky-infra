@@ -1,0 +1,13 @@
+{
+  "id": "dentistmichaelnabil/micky-montage",
+  "title": "Micky Montage Pipeline",
+  "code_file": "kernel_notebook.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": ["dentistmichaelnabil/micky-assets"],
+  "competition_sources": [],
+  "kernel_sources": []
+}

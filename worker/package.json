@@ -10,7 +10,9 @@
     "db:migrate": "wrangler d1 execute micky-db --file=migrations/0001_init.sql",
     "db:query": "wrangler d1 execute micky-db --command",
     "secret:set": "wrangler secret put",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@cloudflare/workers-types": "^4.20241101.0",

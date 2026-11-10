@@ -310,6 +310,67 @@ export function montageModeKeyboard(): TelegramInlineKeyboardMarkup {
 }
 
 /**
+ * Multi-cam sync selector — shown when the bot detects multiple video
+ * uploads in one message (or in quick succession). The user picks how
+ * to align the cameras.
+ *
+ *   🎯 Audio cross-correlation → `multicam:sync:auto`
+ *      (B15: FFT cross-correlation; handles up to 60s offset)
+ *   👏 Clap detection          → `multicam:sync:clap_detection`
+ *      (B15: spectral flux; precise when a slate was used)
+ *   ✏️ Manual offset           → `multicam:sync:manual`
+ *      (User enters per-camera offsets in seconds)
+ *   ⏭️ Skip multi-cam           → `multicam:sync:skip`
+ *      (Treat each video as an independent montage job)
+ *
+ * After the user picks a sync method, the worker also asks for the
+ * switching mode (smart | round_robin | beat_sync | speaker) via
+ * `multicamSwitchModeKeyboard()`.
+ */
+export function multicamSyncKeyboard(): TelegramInlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [
+        { text: '🎯 توافق صوتي (auto)', callback_data: 'multicam:sync:auto' },
+      ],
+      [
+        { text: '👏 اكتشاف التصفيق', callback_data: 'multicam:sync:clap_detection' },
+        { text: '✏️ إزاحة يدوية', callback_data: 'multicam:sync:manual' },
+      ],
+      [
+        { text: '⏭️ تخطّي (كل فيديو منفصل)', callback_data: 'multicam:sync:skip' },
+        { text: '❌ إلغاء', callback_data: 'cancel:' },
+      ],
+    ],
+  };
+}
+
+/**
+ * Multi-cam switching-mode selector — shown after the user picks a sync
+ * method. The four modes are described in `README_multicam.md`.
+ *
+ *   🧠 Smart (auto-best camera)   → `multicam:mode:smart`
+ *   🔁 Round-robin (every N sec)  → `multicam:mode:round_robin`
+ *   🎵 Beat-sync (on music beats) → `multicam:mode:beat_sync`
+ *   🗣️ Active speaker (loudest)   → `multicam:mode:speaker`
+ */
+export function multicamSwitchModeKeyboard(): TelegramInlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [{ text: '🧠 ذكي (أفضل كاميرا)', callback_data: 'multicam:mode:smart' }],
+      [
+        { text: '🔁 تناوب', callback_data: 'multicam:mode:round_robin' },
+        { text: '🎵 مع الإيقاع', callback_data: 'multicam:mode:beat_sync' },
+      ],
+      [
+        { text: '🗣️ المتحدّث النشط', callback_data: 'multicam:mode:speaker' },
+        { text: '❌ إلغاء', callback_data: 'cancel:' },
+      ],
+    ],
+  };
+}
+
+/**
  * Per-task actions keyboard — attached to the message announcing a
  * queued / running async task (e.g. a montage job).
  *

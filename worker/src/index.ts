@@ -15,6 +15,13 @@
 
 import { processQueuedTask, type QueueMessage } from './core/queue_manager';
 import { handleScheduled } from './cron';
+// ============ Multi-provider LLM Gateway (Task A1-retry) ============
+// The gateway module exposes `routeChat` (the OpenAI-compatible multi-provider
+// cascade entry point), `handleProviderFeedback` (thumbs-up/down for the
+// dashboard's per-provider analytics), and `getDashboardData` (snapshot of
+// every provider's health + quota for the /v1/dashboard route).
+import { routeChat, handleProviderFeedback } from './gateway';
+import { ProviderMonitor } from './gateway/monitoring';
 
 export interface Env {
   // D1 Database
@@ -24,6 +31,11 @@ export interface Env {
   TASK_STATUS: KVNamespace;
   RATE_LIMITS: KVNamespace;
   PROMPT_CACHE: KVNamespace;
+  // Task B13: brand-asset KV namespace.  Holds binary blobs (logos,
+  // fonts, intro/outro clips, LUTs) keyed by `{userId}/{type}/{uuid}`.
+  // Metadata + active-profile pointer live in the brand_profiles /
+  // brand_assets D1 tables (see migration 0004_brand_assets.sql).
+  BRAND_ASSETS: KVNamespace;
   // Queue
   TASKS_QUEUE: Queue<QueueMessage>;
   // Workers AI
@@ -44,6 +56,29 @@ export interface Env {
   GH_PAT_SCOPED: string;
   GH_WEBHOOK_SECRET: string;
   KAGGLE_API_TOKEN: string;
+  // ============ Multi-provider LLM Gateway (Task A1-retry) ============
+  // Provider API keys. Each is REQUIRED by the gateway's `ProviderKeys`
+  // interface; at runtime a missing/empty key is treated as "provider
+  // unconfigured" and the provider is skipped in the cascade (see
+  // `gateway/registry.ts` `isProviderConfigured`).
+  GROQ_KEY_1: string;
+  GROQ_KEY_2: string;
+  GEMINI_KEY: string;
+  MISTRAL_KEY: string;
+  OPENROUTER_KEY: string;
+  SAMBANOVA_KEY: string;
+  COHERE_KEY: string;
+  SILICONFLOW_KEY: string;
+  CEREBRAS_KEY: string;
+  NOVITA_KEY: string;
+  // ============ B9: HF Spaces ZeroGPU + Modal serverless ============
+  // All optional — if missing, dispatchToHFSpaces / dispatchToModal throw
+  // informative errors and callers fall back to Kaggle.
+  HF_TOKEN?: string;
+  HF_SPACE_ID?: string;
+  MODAL_TOKEN_ID?: string;
+  MODAL_TOKEN_SECRET?: string;
+  MODAL_APP_NAME?: string;
 }
 
 // ============ Router ============
@@ -97,9 +132,29 @@ export default {
         });
       }
 
-      // ============ BYOK: Chat Completions (OpenAI-compatible) ============
+      // ============ BYOK: Chat Completions (OpenAI-compatible, multi-provider cascade) ============
+      // Task A1-retry: delegates to `gateway.routeChat` which runs the
+      // 11-provider cascade (groq/gemini/mistral/openrouter/workersai/sambanova/
+      // cohere/siliconflow/cerebras/novita). The auth + rate-limit check stays
+      // in `handleChatCompletions`; the actual inference is now the gateway's
+      // job (previously Workers AI only).
       if (path === '/v1/chat/completions' && method === 'POST') {
-        return await handleChatCompletions(request, env);
+        return await handleChatCompletions(request, env, ctx);
+      }
+
+      // ============ BYOK: Provider Feedback (Task A1-retry) ============
+      // POST /v1/feedback { message_id: string, rating: 1 | -1 }
+      // Records user thumbs-up/down feedback for the provider that served the
+      // message. Used by the dashboard's per-provider quality metrics.
+      if (path === '/v1/feedback' && method === 'POST') {
+        return await handleFeedback(request, env);
+      }
+
+      // ============ BYOK: Provider Dashboard (Task A1-retry) ============
+      // GET /v1/dashboard — returns snapshot of every provider's health +
+      // quota + 24h call metrics. Powered by Agent A9's `ProviderMonitor`.
+      if (path === '/v1/dashboard' && method === 'GET') {
+        return await handleDashboard(request, env);
       }
 
       // ============ Kaggle Webhook (kernel completion callback) ============
@@ -128,9 +183,14 @@ export default {
     }
   },
 
-  // ============ Cron Trigger (every 5 min) ============
+  // ============ Cron Trigger ============
+  // Routes to:
+  //   '*/5 * * * *'  → handleScheduled Kaggle stale-task poll
+  //   '*/30 * * * *' → gateway health-check cron (Agent A9)
+  //   '0 0 * * *'    → gateway daily-quota reset (Agent A9)
+  // See gateway/cron_handler.ts + cron.ts for the dispatch logic.
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(handleScheduled(env));
+    ctx.waitUntil(handleScheduled(env, ctx, event.cron));
   },
 };
 
@@ -167,7 +227,7 @@ async function handleTelegramWebhook(request: Request, env: Env, ctx: ExecutionC
   }
 
   // Process in background (don't block Telegram)
-  ctx.waitUntil(processTelegramUpdate(update, env));
+  ctx.waitUntil(processTelegramUpdate(update, env, ctx));
 
   return json({ ok: true });
 }
@@ -290,7 +350,11 @@ async function handleKaggleWebhook(request: Request, env: Env): Promise<Response
 }
 
 // ============ BYOK: Chat Completions ============
-async function handleChatCompletions(request: Request, env: Env): Promise<Response> {
+async function handleChatCompletions(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<Response> {
   // Verify API key (X-API-Key or Authorization Bearer)
   // Be tolerant: trim whitespace, support both Bearer and lowercase bearer.
   const authHeader = request.headers.get('Authorization') || '';
@@ -345,21 +409,6 @@ async function handleChatCompletions(request: Request, env: Env): Promise<Respon
     }
   }
 
-  // Select model (default: 32B Coder). Unknown models fall through to default.
-  const modelMapping: Record<string, string> = {
-    'qwen2.5-coder-32b': env.DEFAULT_MODEL,
-    'qwen2.5-coder-14b': env.FAST_MODEL,
-    'qwen2.5-coder-7b': '@cf/qwen/qwen2.5-coder-7b-instruct',
-    // Aliases common in BYOK clients
-    'gpt-4': env.DEFAULT_MODEL,
-    'gpt-4o': env.DEFAULT_MODEL,
-    'gpt-3.5-turbo': env.FAST_MODEL,
-    'claude-3-opus': env.DEFAULT_MODEL,
-    'claude-3-sonnet': env.FAST_MODEL,
-  };
-  const requestedModel = body.model || 'qwen2.5-coder-32b';
-  const cfModel = modelMapping[requestedModel] || env.DEFAULT_MODEL;
-
   // Check rate limits (KV counter)
   const today = new Date().toISOString().split('T')[0];
   const rateKey = `ratelimit:${(keyRecord as { id: string }).id}:${today}`;
@@ -375,26 +424,64 @@ async function handleChatCompletions(request: Request, env: Env): Promise<Respon
     return json({ error: 'Rate limit exceeded', limit: dailyLimit, used: current, code: 'rate_limited' }, 429);
   }
 
-  // Call Workers AI with graceful error handling
-  let aiResponse: unknown;
+  // ============ Task A1-retry: delegate to the multi-provider gateway ============
+  // Previously this called `env.AI.run(cfModel, ...)` (Workers AI only).
+  // Now we hand off to `gateway.routeChat(body, env, ctx)`, which runs the
+  // 11-provider cascade (groq/gemini/mistral/openrouter/workersai/sambanova/
+  // cohere/siliconflow/cerebras/novita) and returns an OpenAI-compatible
+  // Response (JSON for non-stream, SSE for stream).
+  //
+  // The gateway handles:
+  //   - intent detection (chat / code / vision / tools / fast / long_context)
+  //   - per-intent cascade ordering
+  //   - per-provider API key resolution from env
+  //   - rate-limit / circuit-breaker state in D1
+  //   - SSE stream normalisation to OpenAI shape
+  //   - structured error responses with the list of attempted providers
+  //
+  // We still increment the KV rate-limit counter + update last_used + log
+  // usage after a successful call. The gateway itself records the per-provider
+  // call audit in `provider_calls` via its QuotaLedger.
+
+  // Build the gateway request. We pass through unknown fields via the index
+  // signature on ChatRequest; the gateway tolerates provider-specific extras.
+  // `model` is required by the gateway's ChatRequest; default to a sentinel
+  // when the client didn't specify one (the gateway will pick the best
+  // model per (intent, provider) anyway).
+  //
+  // Cast through `unknown` because the gateway's `ChatMessage.role` is a
+  // `ChatRole` union (`'system' | 'user' | 'assistant' | 'tool'`) but the
+  // local `ChatCompletionRequest.messages[].role` is typed as `string` (we
+  // validated it's one of the valid roles above, so the cast is safe).
+  const gatewayReq = {
+    model: body.model ?? 'auto',
+    messages: body.messages,
+    temperature: body.temperature,
+    max_tokens: body.max_tokens,
+    top_p: body.top_p,
+    stream: body.stream === true,
+    stop: body.stop,
+  } as unknown as Parameters<typeof routeChat>[0];
+
+  let gatewayResponse: Response;
   try {
-    aiResponse = await env.AI.run(cfModel, {
-      messages: body.messages,
-      // Use ?? for top_p/temperature (|| coerces 0 to default, which is wrong)
-      max_tokens: body.max_tokens || parseInt(env.MAX_TOKENS_DEFAULT, 10),
-      temperature: body.temperature ?? parseFloat(env.TEMPERATURE_DEFAULT),
-      top_p: body.top_p ?? 0.8,
-      stream: body.stream === true,
-    });
-  } catch (aiErr) {
-    console.error('Workers AI call failed:', aiErr);
+    gatewayResponse = await routeChat(gatewayReq, env, ctx);
+  } catch (err) {
+    // Defensive: routeChat should never throw (it returns an error Response
+    // on any failure), but if it does we surface a 502 with the message.
+    console.error('routeChat threw:', err);
     return json({
-      error: 'Model inference failed',
-      code: 'model_error',
-      message: String(aiErr),
-      // OpenAI-compatible shape
+      error: 'Gateway inference failed',
+      code: 'gateway_error',
+      message: String(err),
       type: 'server_error',
     }, 502);
+  }
+
+  // If the gateway returned a non-2xx, propagate it unchanged — the gateway
+  // has already shaped the error body into the OpenAI error format.
+  if (!gatewayResponse.ok) {
+    return gatewayResponse;
   }
 
   // Increment rate limit (best-effort)
@@ -412,149 +499,72 @@ async function handleChatCompletions(request: Request, env: Env): Promise<Respon
     console.error('last_used update failed:', e);
   }
 
-  // Log usage (best-effort)
-  try {
-    await env.DB.prepare(
-      'INSERT INTO system_logs (level, component, message, meta) VALUES (?, ?, ?, ?)'
-    ).bind('info', 'byok', 'chat completion', JSON.stringify({
-      key_id: (keyRecord as { id: string }).id,
-      model: requestedModel,
-      tokens: (aiResponse as { usage?: { total_tokens?: number } }).usage?.total_tokens,
-    })).run();
-  } catch (e) {
-    console.error('system_logs insert failed:', e);
-  }
-
-  // ============ STREAMING (OpenAI-compatible SSE) ============
-  // Workers AI returns a ReadableStream when stream: true is passed.
-  // We need to transform each chunk from CF format ({response: "..."}) to OpenAI format ({choices:[{delta:{content:"..."}}]}).
-  if (body.stream === true) {
-    const chatId = `chatcmpl-${crypto.randomUUID()}`;
-    const created = Math.floor(Date.now() / 1000);
-
-    // Check if aiResponse is actually a ReadableStream
-    if (aiResponse instanceof ReadableStream) {
-      const transformedStream = aiResponse.pipeThrough(new TransformStream({
-        transform(chunk, controller) {
-          // Workers AI streaming chunks come as JSON strings ending in \n
-          // Some chunks may be partial — buffer them
-          try {
-            const text = typeof chunk === 'string' ? chunk : new TextDecoder().decode(chunk as ArrayBuffer);
-            // Workers AI streams chunks like: data: {"response":"...","usage":{...}}\n\n
-            // OR raw JSON lines: {"response":"..."}\n
-            // Split on newlines and parse each line
-            const lines = text.split('\n');
-            for (const line of lines) {
-              const trimmed = line.trim();
-              if (!trimmed) continue;
-              let parsed: { response?: string; usage?: Record<string, unknown> };
-              try {
-                // Strip "data: " prefix if present
-                const jsonStr = trimmed.startsWith('data: ') ? trimmed.slice(6) : trimmed;
-                if (jsonStr === '[DONE]') {
-                  controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
-                  continue;
-                }
-                parsed = JSON.parse(jsonStr);
-              } catch {
-                continue; // skip unparseable partial chunks
-              }
-              // Emit OpenAI-compatible SSE chunk
-              const openaiChunk = {
-                id: chatId,
-                object: 'chat.completion.chunk',
-                created,
-                model: requestedModel,
-                choices: [{
-                  index: 0,
-                  delta: { content: parsed.response || '' },
-                  finish_reason: null,
-                }],
-              };
-              controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(openaiChunk)}\n\n`));
-            }
-          } catch (err) {
-            console.error('Stream transform error:', err);
-          }
-        },
-      }));
-
-      return new Response(transformedStream, {
-        headers: {
-          'Content-Type': 'text/event-stream; charset=utf-8',
-          'Cache-Control': 'no-cache, no-transform',
-          'Connection': 'keep-alive',
-          'Access-Control-Allow-Origin': '*',
-        },
-      });
-    } else {
-      // Worker AI returned a non-stream response even though stream: true was requested.
-      // Fall back to non-streaming response with a single chunk.
-      const text = (aiResponse as { response?: string }).response || '';
-      const chunks = text.match(/.{1,3}/g) || [text];
-      const encoder = new TextEncoder();
-      const stream = new ReadableStream({
-        start(controller) {
-          for (const chunk of chunks) {
-            const openaiChunk = {
-              id: chatId,
-              object: 'chat.completion.chunk',
-              created,
-              model: requestedModel,
-              choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }],
-            };
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify(openaiChunk)}\n\n`));
-          }
-          // Final chunk with finish_reason: stop + usage
-          const finalChunk = {
-            id: chatId,
-            object: 'chat.completion.chunk',
-            created,
-            model: requestedModel,
-            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-            usage: (aiResponse as { usage?: Record<string, unknown> }).usage,
-          };
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
-          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-          controller.close();
-        },
-      });
-      return new Response(stream, {
-        headers: {
-          'Content-Type': 'text/event-stream; charset=utf-8',
-          'Cache-Control': 'no-cache, no-transform',
-          'Connection': 'keep-alive',
-          'Access-Control-Allow-Origin': '*',
-        },
-      });
+  // Log usage (best-effort). For streaming responses we can't read the body
+  // without consuming it, so we skip token logging on stream — the gateway's
+  // own per-provider audit row carries that information.
+  if (body.stream !== true) {
+    try {
+      // Clone the response so we can read the body for logging without
+      // consuming the stream we're about to return to the client.
+      const logClone = gatewayResponse.clone();
+      const parsed = await logClone.json() as { usage?: { total_tokens?: number }; provider?: string };
+      await env.DB.prepare(
+        'INSERT INTO system_logs (level, component, message, meta) VALUES (?, ?, ?, ?)'
+      ).bind('info', 'byok', 'chat completion', JSON.stringify({
+        key_id: (keyRecord as { id: string }).id,
+        model: body.model,
+        provider: parsed.provider,
+        tokens: parsed.usage?.total_tokens,
+      })).run();
+    } catch (e) {
+      console.error('system_logs insert failed:', e);
     }
   }
 
-  // ============ NON-STREAMING (OpenAI-compatible) ============
-  const aiRes = aiResponse as { response?: string; usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } };
-  const response = {
-    id: `chatcmpl-${crypto.randomUUID()}`,
-    object: 'chat.completion',
-    created: Math.floor(Date.now() / 1000),
-    model: requestedModel,
-    choices: [
-      {
-        index: 0,
-        message: {
-          role: 'assistant',
-          content: aiRes.response || '',
-        },
-        finish_reason: 'stop',
-      },
-    ],
-    usage: aiRes.usage || {
-      prompt_tokens: 0,
-      completion_tokens: 0,
-      total_tokens: 0,
-    },
-  };
+  return gatewayResponse;
+}
 
-  return json(response);
+// ============ Provider Feedback Handler (Task A1-retry) ============
+// POST /v1/feedback { message_id: string, rating: 1 | -1 }
+// Records user thumbs-up/down feedback for the provider that served a given
+// message id. Best-effort: D1 failures return 200 with a warning so the
+// client UX (a thumbs-up/down button click) never errors.
+async function handleFeedback(request: Request, env: Env): Promise<Response> {
+  let body: { message_id?: string; rating?: number };
+  try {
+    body = await request.json() as { message_id?: string; rating?: number };
+  } catch {
+    return json({ error: 'Invalid JSON in request body', code: 'invalid_json' }, 400);
+  }
+
+  if (!body.message_id || typeof body.message_id !== 'string') {
+    return json({ error: 'message_id is required and must be a string', code: 'invalid_message_id' }, 400);
+  }
+  if (body.rating !== 1 && body.rating !== -1) {
+    return json({ error: 'rating must be 1 (thumbs-up) or -1 (thumbs-down)', code: 'invalid_rating' }, 400);
+  }
+
+  try {
+    await handleProviderFeedback(body.message_id, body.rating as 1 | -1, env);
+  } catch (err) {
+    console.error('handleProviderFeedback failed:', err);
+    // Still return 200 — feedback is best-effort.
+  }
+  return json({ ok: true, message_id: body.message_id, rating: body.rating });
+}
+
+// ============ Provider Dashboard Handler (Task A1-retry) ============
+// GET /v1/dashboard — returns a snapshot of every provider's health + quota
+// + 24h call metrics. Powered by Agent A9's `ProviderMonitor.getDashboardData`.
+async function handleDashboard(request: Request, env: Env): Promise<Response> {
+  try {
+    const monitor = new ProviderMonitor(env);
+    const data = await monitor.getDashboardData(env);
+    return json(data);
+  } catch (err) {
+    console.error('Dashboard query failed:', err);
+    return json({ error: 'Dashboard query failed', message: String(err) }, 500);
+  }
 }
 
 // ============ Media Message Handler (video / voice / document / photo) ============
@@ -610,6 +620,28 @@ async function handleMediaMessage(
     const duration = (mediaFile as TelegramFile & { duration?: number }).duration || 0;
     const width = (mediaFile as TelegramFile & { width?: number }).width || 0;
     const height = (mediaFile as TelegramFile as unknown as { height?: number }).height || 0;
+    const videoUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${filePath}`;
+    const filename = caption || `video_${msg.message_id}.mp4`;
+
+    // B15: multi-cam detection. If the user has sent (or is about to send)
+    // multiple videos within a 60s window, prompt for sync method instead
+    // of immediately starting a single-cam montage task.
+    try {
+      const { handleMulticamVideoUpload } = await import('./bot/handlers');
+      const triggeredMulticam = await handleMulticamVideoUpload(
+        env, chatId, videoUrl, filename, fileSize, duration, msg.message_id,
+      );
+      if (triggeredMulticam) {
+        // The user will pick a sync + switch mode in the next step.
+        // Don't enqueue a single-cam task now — handleMulticamSwitchModeChoice
+        // (called when the user picks a switch mode) will enqueue the proper
+        // multi-cam task.
+        return;
+      }
+    } catch (e) {
+      console.error('Multi-cam detection failed (non-fatal):', e);
+      // Fall through to the single-cam path below.
+    }
 
     // Persist file URL reference in D1 (so the queue consumer can fetch it)
     const fileId2 = crypto.randomUUID();
@@ -619,8 +651,8 @@ async function handleMediaMessage(
       fileId2,
       'proj_test_001', // default project for admin testing
       'video',
-      caption || `video_${msg.message_id}.mp4`,
-      `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${filePath}`,
+      filename,
+      videoUrl,
       'telegram',
       fileSize,
       Date.now() / 1000,
@@ -637,7 +669,7 @@ async function handleMediaMessage(
       'queued',
       5,
       JSON.stringify({
-        file_url: `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${filePath}`,
+        file_url: videoUrl,
         caption,
         duration_sec: duration,
         width,
@@ -657,7 +689,7 @@ async function handleMediaMessage(
         taskId: taskId,
         chatId: chatId,
         payload: {
-          file_url: `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${filePath}`,
+          file_url: videoUrl,
           caption,
           duration,
           message_id: msg.message_id,
@@ -823,7 +855,34 @@ async function handleMediaMessage(
 }
 
 // ============ Process Telegram Update ============
-async function processTelegramUpdate(update: TelegramUpdate, env: Env): Promise<void> {
+async function processTelegramUpdate(update: TelegramUpdate, env: Env, ctx: ExecutionContext): Promise<void> {
+  // Task B11/B13: dispatch callback_query (inline keyboard) for the brand
+  // setup wizard and the storyboard approval flow. The storyboard handler
+  // acks the query itself; the brand handler is acked above.
+  if (update.callback_query) {
+    const cq = update.callback_query;
+    const chatId = cq.message?.chat?.id;
+    const data = cq.data ?? '';
+    if (chatId && data.startsWith('brand:setup:')) {
+      try {
+        await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ callback_query_id: cq.id }),
+        });
+      } catch (err) {
+        console.warn('[callback] answerCallbackQuery failed:', err);
+      }
+      const { handleBrandSetupCallback } = await import('./bot/brand_setup');
+      await handleBrandSetupCallback(env, undefined, chatId, data);
+    } else if (chatId && data.startsWith('sb:')) {
+      // Task B11: storyboard approval flow (approve / edit / regen / cancel).
+      const { routeCallbackQuery } = await import('./bot/handlers');
+      await routeCallbackQuery(env, ctx, cq as Parameters<typeof routeCallbackQuery>[2]);
+    }
+    return;
+  }
+
   const msg = update.message || update.edited_message;
   if (!msg) return;
 
@@ -840,6 +899,30 @@ async function processTelegramUpdate(update: TelegramUpdate, env: Env): Promise<
   const text = msg.text || '';
   const caption = msg.caption || '';
   const user = msg.from;
+
+  // ============ Task B13: brand wizard + logo photo interception ============
+  // If a brand setup wizard is in progress (step=logo) OR the user has a
+  // pending logo-upload state (from `/brand logo`), intercept photos
+  // before the generic media handler so they go to the brand manager.
+  if (msg.photo && msg.photo.length > 0) {
+    const { hasActiveBrandWizard } = await import('./bot/handlers');
+    const wizardActive = await hasActiveBrandWizard(env, chatId);
+    let logoPending = false;
+    if (!wizardActive) {
+      const { getBrandLogoPending } = await import('./bot/handlers');
+      logoPending = (await getBrandLogoPending(env, chatId)) !== null;
+    }
+    if (wizardActive) {
+      const { handleBrandSetupPhoto } = await import('./bot/brand_setup');
+      await handleBrandSetupPhoto(env, undefined, chatId, msg.photo);
+      return;
+    }
+    if (logoPending) {
+      const { handleBrandLogoPhoto } = await import('./bot/handlers');
+      const consumed = await handleBrandLogoPhoto(env, chatId, msg.photo);
+      if (consumed) return;
+    }
+  }
 
   // ============ Media handling (video / voice / document / photo) ============
   // If the message has a media attachment, route it through the file handler
@@ -894,6 +977,7 @@ async function processTelegramUpdate(update: TelegramUpdate, env: Env): Promise<
       '📂 /projects - إدارة المشاريع',
       '📊 /stats - الإحصائيات',
       '⚙️ /settings - الإعدادات',
+      '🎨 /brand - هوية بصرية (شعار/ألوان/خطوط)',
     ].join('\n'));
     return;
   }
@@ -917,6 +1001,7 @@ async function processTelegramUpdate(update: TelegramUpdate, env: Env): Promise<
       '/stats - إحصائيات الاستخدام',
       '/health - حالة النظام',
       '/cancel - إلغاء المهمة الحالية',
+      '/brand - إدارة الهوية البصرية (شعار/ألوان/خطوط)',
     ].join('\n'));
     return;
   }
@@ -1043,6 +1128,29 @@ async function processTelegramUpdate(update: TelegramUpdate, env: Env): Promise<
     return;
   }
 
+  // ============ /brand — Brand profile management (Task B13) ============
+  // Routes to handleBrandCommand which itself dispatches to:
+  //   set / logo / font / color / profile / list / new / delete
+  if (text === '/brand' || text.startsWith('/brand ')) {
+    const { handleBrandCommand } = await import('./bot/handlers');
+    const args = text.startsWith('/brand ') ? text.slice(7).trim() : '';
+    await handleBrandCommand(env, chatId, args);
+    return;
+  }
+
+  // ============ /skip — Brand setup wizard skip (Task B13) ============
+  // Only meaningful inside the brand setup wizard's logo step.  Outside
+  // of the wizard it falls through to the "unknown command" message.
+  if (text === '/skip') {
+    const { hasActiveBrandWizard } = await import('./bot/handlers');
+    if (await hasActiveBrandWizard(env, chatId)) {
+      const { handleBrandSetupSkip } = await import('./bot/brand_setup');
+      await handleBrandSetupSkip(env, chatId);
+      return;
+    }
+    // No active wizard → fall through to unknown-command handler.
+  }
+
   // ============ /projects — Project Management ============
   if (text === '/projects' || text === '/newproject') {
     const { handleProjectsCommand, handleNewProjectCommand } = await import('./bot/handlers');
@@ -1061,12 +1169,48 @@ async function processTelegramUpdate(update: TelegramUpdate, env: Env): Promise<
     return;
   }
 
+  // ============ /storyboard — Storyboard approval (Task B11) ============
+  if (text === '/storyboard' || text.startsWith('/storyboard ')) {
+    const { handleStoryboardCommand } = await import('./bot/handlers');
+    const taskId = text.startsWith('/storyboard ')
+      ? text.slice('/storyboard '.length).trim() || undefined
+      : undefined;
+    await handleStoryboardCommand(env, chatId, taskId);
+    return;
+  }
+
+  // ============ /approve — Approve pending storyboard (Task B11) ============
+  if (text === '/approve') {
+    const { handleApproveCommand } = await import('./bot/handlers');
+    await handleApproveCommand(env, chatId);
+    return;
+  }
+
+  // ============ /edit — Edit a take (Task B11) ============
+  // Syntax: /edit <take#> <free-text description>
+  if (text.startsWith('/edit ')) {
+    const { handleEditCommand } = await import('./bot/handlers');
+    await handleEditCommand(env, chatId, text.slice('/edit '.length));
+    return;
+  }
+
   // ============ Check for active wizard ============
   if (text && !text.startsWith('/')) {
-    const { hasActiveWizard, handleNewProjectWizardStep } = await import('./bot/handlers');
+    const { hasActiveWizard, handleNewProjectWizardStep,
+            hasActiveStoryboardEdit, getActiveStoryboardEdit,
+            handleStoryboardEdit } = await import('./bot/handlers');
     if (await hasActiveWizard(env, chatId)) {
       await handleNewProjectWizardStep(env, chatId, text);
       return;
+    }
+    // Task B11: storyboard take-edit wizard — free-text message becomes
+    // the edit description for the take the user just selected.
+    if (await hasActiveStoryboardEdit(env, chatId)) {
+      const state = await getActiveStoryboardEdit(env, chatId);
+      if (state) {
+        await handleStoryboardEdit(env, ctx, chatId, state.take_idx, text);
+        return;
+      }
     }
 
     // ============ Text Mode: Full AI Response with Prompt Compiler ============
@@ -1140,6 +1284,13 @@ interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
   edited_message?: TelegramMessage;
+  // Task B13: brand setup wizard callback query support.
+  callback_query?: {
+    id: string;
+    data?: string;
+    from?: { id: number; first_name?: string; username?: string };
+    message?: { message_id: number; chat: { id: number; type: string } };
+  };
 }
 
 interface TelegramMessage {
@@ -1177,4 +1328,5 @@ interface ChatCompletionRequest {
   temperature?: number;
   top_p?: number;
   stream?: boolean;
+  stop?: string | string[];
 }

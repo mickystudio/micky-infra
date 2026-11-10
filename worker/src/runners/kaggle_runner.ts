@@ -11,15 +11,24 @@
 
 import type { Env } from '../index';
 import type { Task } from '../core/state_machine';
+import {
+  HFSpacesClient,
+  HFSpacesUnavailable,
+} from './hf_spaces_client';
 
 // ============ Constants ============
 
 const KAGGLE_API_BASE = 'https://www.kaggle.com/api/v1';
 const KERNEL_SLUG_PREFIX = 'micky';
+const MODAL_API_BASE = 'https://modal.com/api/v1';
+const MODAL_DEFAULT_TIMEOUT_MS = 300_000;
 
 // ============ Types ============
 
 export type KaggleStatus = 'running' | 'complete' | 'cancelled' | 'error';
+
+/** Task types supported by HF Spaces ZeroGPU dispatch (B9). */
+export type HFTaskType = 'vlm' | 'video_gen';
 
 export interface KaggleFile {
   filename: string;
@@ -510,4 +519,122 @@ async function safeReadText(response: Response): Promise<string> {
   } catch {
     return '<no body>';
   }
+}
+
+// ============ HF Spaces ZeroGPU dispatch (B9) ============
+//
+// Uses `HFSpacesClient` to push VLM / video-gen jobs to an HF Space
+// running on free ZeroGPU hardware (RTX Pro 6000, up to 96 GB VRAM).
+// Throws `HFSpacesUnavailable` on any failure — caller MUST catch and
+// fall back to Kaggle (`dispatchToKaggle`).
+//
+// See `runners/hf_spaces_client.ts` for the full HTTP contract.
+
+/**
+ * Dispatch a task to an HF Space running on ZeroGPU.
+ *
+ * @param env       Worker env (must contain HF_TOKEN).
+ * @param task_type One of 'vlm' or 'video_gen'.
+ * @param payload   {images: string[], prompt: string} for 'vlm';
+ *                  {prompt: string, duration?: number} for 'video_gen'.
+ * @returns         VLM: {scores: number[], reasoning: string};
+ *                  video_gen: {resultUrl: string}.
+ */
+export async function dispatchToHFSpaces(
+  env: Env,
+  task_type: HFTaskType,
+  payload: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  const client = new HFSpacesClient(env);
+
+  if (task_type === 'vlm') {
+    const images = Array.isArray(payload.images) ? (payload.images as string[]) : [];
+    const prompt = typeof payload.prompt === 'string' ? payload.prompt : '';
+    if (!images.length) {
+      throw new HFSpacesUnavailable('dispatchToHFSpaces(vlm): no images supplied');
+    }
+    const result = await client.runVLM(env, images, prompt);
+    return { scores: result.scores, reasoning: result.reasoning };
+  }
+
+  if (task_type === 'video_gen') {
+    const prompt = typeof payload.prompt === 'string' ? payload.prompt : '';
+    const duration = typeof payload.duration === 'number' ? payload.duration : 5.0;
+    if (!prompt) {
+      throw new HFSpacesUnavailable('dispatchToHFSpaces(video_gen): empty prompt');
+    }
+    const resultUrl = await client.runVideoGeneration(env, prompt, duration);
+    return { resultUrl };
+  }
+
+  throw new Error(`dispatchToHFSpaces: unsupported task_type '${task_type}'`);
+}
+
+// ============ Modal serverless dispatch (B9) ============
+//
+// Calls the Modal HTTP API to invoke a serverless GPU function.
+// Modal gives $30/mo recurring free credits — used for async batch
+// jobs (e.g. scoring 100 takes in parallel) where Kaggle's 2-session
+// limit and HF Spaces' ZeroGPU queue are the bottleneck.
+
+/**
+ * Dispatch a Modal function invocation.
+ *
+ * @param env            Worker env (MODAL_TOKEN_ID, MODAL_TOKEN_SECRET required).
+ * @param function_name  Deployed Modal function name (no app prefix).
+ * @param args           JSON-serialisable args dict passed to the function.
+ * @param timeout_ms     Hard timeout. Default 300 s (5 min).
+ * @returns              The function's JSON return value as a dict.
+ * @throws               Error if Modal credentials missing (caller falls back).
+ */
+export async function dispatchToModal(
+  env: Env,
+  function_name: string,
+  args: Record<string, unknown>,
+  timeout_ms: number = MODAL_DEFAULT_TIMEOUT_MS
+): Promise<Record<string, unknown>> {
+  const tokenId = (env.MODAL_TOKEN_ID ?? '').trim();
+  const tokenSecret = (env.MODAL_TOKEN_SECRET ?? '').trim();
+  if (!tokenId || !tokenSecret) {
+    throw new Error(
+      'Modal not configured. Setup:\n' +
+        '  wrangler secret put MODAL_TOKEN_ID     # ak-...\n' +
+        '  wrangler secret put MODAL_TOKEN_SECRET # as-...\n' +
+        'Optional: wrangler secret put MODAL_APP_NAME  # default: micky-montage\n' +
+        'Free tier: $30/mo recurring credits.'
+    );
+  }
+  const appName = (env.MODAL_APP_NAME ?? 'micky-montage').trim();
+  const auth = btoa(`${tokenId}:${tokenSecret}`);
+  const url = `${MODAL_API_BASE}/${appName}/${function_name}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout_ms + 30_000);
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${auth}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'MickyModalRunner/1.0',
+      },
+      body: JSON.stringify({
+        args,
+        timeout: Math.floor(timeout_ms / 1000),
+      }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    throw new Error(`Modal invoke ${function_name} network error: ${String(err)}`);
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!response.ok) {
+    const text = await safeReadText(response);
+    throw new Error(
+      `Modal invoke ${function_name} failed (${response.status}): ` +
+        `${text.slice(0, 300)}`
+    );
+  }
+  return (await response.json()) as Record<string, unknown>;
 }

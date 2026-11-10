@@ -2,3 +2,11 @@
 # Pinned for reproducibility.
 requests>=2.32,<3
 pyyaml>=6.0,<7
+
+# Beat-synced montage (P4-T9): beat-this wraps ISMIR 2024 SOTA beat
+# detection; librosa is the CPU fallback; mutagen tags MP3s with BPM;
+# soundfile is required by librosa for non-wav audio formats.
+beat-this>=1.0
+librosa>=0.10
+mutagen>=1.47
+soundfile>=0.12
