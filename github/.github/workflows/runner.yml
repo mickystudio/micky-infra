@@ -1,0 +1,259 @@
+# Micky Assistant Unlimited — Main Task Runner
+# Triggered by Worker (Cloudflare) via `repository_dispatch` (event=run_task).
+# Also manually triggerable via `workflow_dispatch` for debugging.
+#
+# Lifecycle:
+#   1. Checkout micky-infra (this repo) for scripts.
+#   2. Restore cached GGUF (key=model-14b-v1). On miss: assemble from Releases.
+#   3. Install llama.cpp prebuilt binary.
+#   4. Fetch task spec from micky-vault (private) using GH_PAT.
+#   5. Start llama-server on 127.0.0.1:8080 in background.
+#   6. Wait for /health to return 200.
+#   7. Run inference via run_task.py (OpenAI-compatible call).
+#   8. If task_type=code: run acceptance gates (lint+build+test), retry up to 3x
+#      with error context injected into the prompt on each retry.
+#   9. On success: open PR to micky-vault via open_pr.py.
+#  10. Upload output as Release asset (if large) or PR artifact.
+#  11. Notify Worker via signed webhook (POST /webhook/github).
+#  12. Cleanup (kill llama-server, remove temp files).
+
+name: Micky Task Runner
+
+on:
+  repository_dispatch:
+    types: [run_task]
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: 'Task ID (UUID from Worker)'
+        required: true
+        type: string
+      task_type:
+        description: 'Task type (inference|code|montage|graphics)'
+        required: true
+        type: choice
+        options:
+          - inference
+          - code
+          - montage
+          - graphics
+
+# Only one run per task_id at a time — prevents duplicate PRs.
+concurrency:
+  group: runner-${{ github.event.client_payload.task_id || github.event.inputs.task_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write       # need to upload Release assets + commit to infra
+  pull-requests: write   # opened in micky-vault via PAT (this perm is for infra scope)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest   # 4-core x86, 16GB RAM
+    timeout-minutes: 30
+    env:
+      MODEL_VERSION: v1
+      MODEL_NAME: qwen2.5-coder-14b-q4_k_m
+      MODEL_CACHE_KEY: model-14b-v1
+      MODEL_PATH: models/qwen2.5-coder-14b-q4_k_m.gguf
+      TASK_ID: ${{ github.event.client_payload.task_id || github.event.inputs.task_id }}
+      TASK_TYPE: ${{ github.event.client_payload.task_type || github.event.inputs.task_type }}
+      WORKER_WEBHOOK_URL: ${{ secrets.WORKER_WEBHOOK_URL }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+    steps:
+      # ---------- 1. Checkout ----------
+      - name: Checkout micky-infra (scripts + workflows)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ---------- 2. Setup Python + Node ----------
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: |
+            scripts/requirements.txt
+            scripts/requirements-runner.txt
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f scripts/requirements.txt ]; then pip install -r scripts/requirements.txt; fi
+          # Fallback if no requirements file is committed yet.
+          pip install requests pyyaml
+
+      # ---------- 3. Restore GGUF cache ----------
+      - name: Restore GGUF cache
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.MODEL_PATH }}
+          key: ${{ env.MODEL_CACHE_KEY }}
+          lookup-only: true   # don't download on miss; we assemble explicitly next.
+
+      # ---------- 4. On cache miss: assemble GGUF ----------
+      - name: Assemble GGUF from Release assets
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$(dirname "$MODEL_PATH")"
+          bash scripts/assemble_model.sh "$MODEL_VERSION"
+          # Move assembled file to the cached path
+          mv "./${MODEL_NAME}.gguf" "$MODEL_PATH"
+          ls -lh "$MODEL_PATH"
+
+      - name: Save GGUF to cache
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.MODEL_PATH }}
+          key: ${{ env.MODEL_CACHE_KEY }}
+
+      # ---------- 5. Install llama.cpp prebuilt binary ----------
+      - name: Install llama.cpp (prebuilt)
+        run: |
+          set -euo pipefail
+          # Pin to a known-good release tag for reproducibility.
+          LLAMA_TAG="${LLAMA_TAG:-b3755}"
+          ARCH="linux-x64"
+          TARBALL="llama-${LLAMA_TAG}-bin-ubuntu-x64.zip"
+          URL="https://github.com/ggerganov/llama.cpp/releases/download/${LLAMA_TAG}/${TARBALL}"
+          echo "Downloading $URL"
+          curl -L --fail -o /tmp/llama.zip "$URL"
+          sudo mkdir -p /opt/llama.cpp
+          sudo unzip -o /tmp/llama.zip -d /opt/llama.cpp
+          sudo chmod +x /opt/llama.cpp/llama-server /opt/llama.cpp/llama-cli
+          echo "/opt/llama.cpp" >> "$GITHUB_PATH"
+          # Sanity check
+          llama-server --version || true
+
+      # ---------- 6. Fetch task spec from micky-vault ----------
+      - name: Fetch task spec from micky-vault
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          python3 scripts/fetch_task_spec.py \
+            --task-id "$TASK_ID" \
+            --output /tmp/task.json \
+            --repo mickystudio/micky-vault
+          echo "::notice::Task spec loaded for $TASK_ID"
+          cat /tmp/task.json | python3 -m json.tool | head -50
+
+      # ---------- 7+8. Run inference with retry loop ----------
+      - name: Run inference (with up to 3 retries)
+        id: inference
+        run: |
+          set -uo pipefail
+          mkdir -p /tmp/retries
+          MAX_ATTEMPTS=3
+          ATTEMPT=1
+          STATUS="failed"
+          while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
+            echo "=== Attempt $ATTEMPT/$MAX_ATTEMPTS ==="
+            # Inject prior errors into context for retries > 1.
+            if [ "$ATTEMPT" -gt 1 ] && [ -f /tmp/last_error.txt ]; then
+              python3 scripts/inject_error.py \
+                --task /tmp/task.json \
+                --error /tmp/last_error.txt \
+                --output /tmp/task.json
+            fi
+
+            if bash scripts/run_inference.sh "$MODEL_PATH" /tmp/task.json; then
+              STATUS="passed"
+              break
+            fi
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "attempts=$ATTEMPT" >> "$GITHUB_OUTPUT"
+
+          if [ "$STATUS" != "passed" ]; then
+            echo "::error::Inference failed after $MAX_ATTEMPTS attempts"
+            exit 1
+          fi
+
+      # ---------- 9. Acceptance gates (code tasks only) ----------
+      - name: Run acceptance gates (lint + build + test)
+        if: env.TASK_TYPE == 'code' && steps.inference.outputs.status == 'passed'
+        id: gates
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          cd /tmp/generated || { echo "::error::No generated code dir"; exit 1; }
+          # Generic gates — adapt based on package manifest detected.
+          GATE_STATUS="passed"
+          if [ -f package.json ]; then
+            npm ci || npm install
+            npm run lint   || GATE_STATUS="failed"
+            npm run build  || GATE_STATUS="failed"
+            npm test -- --passWithNoTests || GATE_STATUS="failed"
+          elif [ -f pyproject.toml ] || [ -f requirements.txt ]; then
+            pip install -e . || pip install -r requirements.txt
+            ruff check .     || GATE_STATUS="failed"
+            pytest           || GATE_STATUS="failed"
+          fi
+          echo "gate_status=$GATE_STATUS" >> "$GITHUB_OUTPUT"
+          test "$GATE_STATUS" = "passed"
+
+      # ---------- 10. Open PR to micky-vault (on success) ----------
+      - name: Open Pull Request
+        id: open_pr
+        if: steps.inference.outputs.status == 'passed' && (env.TASK_TYPE != 'code' || steps.gates.outputs.gate_status == 'passed')
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          python3 scripts/open_pr.py /tmp/task.json
+          if [ -f /tmp/pr_url.txt ]; then
+            echo "pr_url=$(cat /tmp/pr_url.txt)" >> "$GITHUB_OUTPUT"
+            echo "::notice::PR opened: $(cat /tmp/pr_url.txt)"
+          fi
+
+      # ---------- 11. Upload output as Release asset (if large) ----------
+      - name: Attach large output to GitHub Release
+        if: steps.inference.outputs.status == 'passed'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: task-${{ env.TASK_ID }}
+          name: "Task ${{ env.TASK_ID }}"
+          files: |
+            /tmp/task_output.json
+            /tmp/generated/**
+          body: |
+            Auto-generated by Micky Assistant runner.
+            Task ID: `${{ env.TASK_ID }}`
+            Type: `${{ env.TASK_TYPE }}`
+            Attempts: ${{ steps.inference.outputs.attempts }}
+
+      # ---------- 12. Notify Worker via webhook ----------
+      - name: Notify Worker (callback)
+        if: always()
+        env:
+          GH_WEBHOOK_SECRET: ${{ secrets.GH_WEBHOOK_SECRET }}
+        run: |
+          set -uo pipefail
+          STATUS="${{ job.status }}"
+          python3 scripts/notify_worker.py \
+            --task-id "$TASK_ID" \
+            --status "$STATUS" \
+            --inference "${{ steps.inference.outputs.status }}" \
+            --gates "${{ steps.gates.outputs.gate_status }}" \
+            --pr-url "${{ steps.open_pr.outputs.pr_url }}" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      # ---------- 13. Cleanup ----------
+      - name: Cleanup
+        if: always()
+        run: |
+          # Kill any lingering llama-server processes.
+          pkill -f llama-server 2>/dev/null || true
+          # Remove temp files (model stays cached).
+          rm -rf /tmp/generated /tmp/task.json /tmp/task_output.json /tmp/retries 2>/dev/null || true
+          echo "Cleanup complete"
