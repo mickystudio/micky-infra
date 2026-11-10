@@ -210,3 +210,21 @@ def _run_ffmpeg(cmd: list[str]) -> None:
             f"command: {' '.join(cmd)}\n"
             f"stderr: {result.stderr[-1500:]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Standalone CLI (for debugging)
+# ---------------------------------------------------------------------------
+if __name__ == '__main__':
+    import sys
+
+    if len(sys.argv) < 3:
+        print('Usage: color_grader.py <video_path> <output_dir> [lut_choice]')
+        print('lut_choice options: ' + ', '.join(LUT_PATHS.keys()))
+        sys.exit(1)
+
+    _video = sys.argv[1]
+    _out_dir = sys.argv[2]
+    _lut = sys.argv[3] if len(sys.argv) > 3 else 'medical_clean'
+    _result = apply_color_grading(_video, _lut, _out_dir)
+    print(f'Graded video → {_result}')
