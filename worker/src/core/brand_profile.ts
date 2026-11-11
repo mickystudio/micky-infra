@@ -178,7 +178,7 @@ function rowToAsset(row: BrandAsset): BrandAsset {
  * SQL injection.
  */
 export class BrandProfileManager {
-  constructor(private readonly db: D1Database) {}
+  constructor(protected readonly db: D1Database) {}
 
   // ---------------- Profiles ----------------
 
@@ -359,4 +359,102 @@ export class BrandProfileManager {
       'DELETE FROM brand_assets WHERE id = ? AND user_id = ?',
     ).bind(assetId, userId).run();
   }
+}
+
+// ============================================================================
+// KV-backed asset upload + manager factory (bot-facing convenience API)
+// ============================================================================
+
+/** Maximum logo upload size — 5 MB (enforced before KV write). */
+export const MAX_LOGO_SIZE_BYTES = 5 * 1024 * 1024;
+
+/** Thrown by {@link BrandProfileManager.uploadAsset} when the file is too large. */
+export class BrandAssetTooLargeError extends Error {
+  constructor(sizeBytes: number) {
+    super(
+      `حجم الملف ${Math.round(sizeBytes / 1024)} كيلوبايت يتجاوز الحد المسموح ` +
+        `${Math.round(MAX_LOGO_SIZE_BYTES / 1024)} كيلوبايت (5MB).`,
+    );
+    this.name = 'BrandAssetTooLargeError';
+  }
+}
+
+/** KV namespace binding shape used by the upload path. */
+interface KVLike {
+  put(key: string, value: ArrayBuffer | string, opts?: { metadata?: unknown }): Promise<void>;
+}
+
+/**
+ * Extended manager: D1 metadata + BRAND_ASSETS KV binary storage.
+ * The base class owns all D1 queries; this subclass adds `uploadAsset`
+ * (binary → KV, metadata → D1) and `setActiveProfile`.
+ */
+export class KVBackedBrandProfileManager extends BrandProfileManager {
+  constructor(
+    db: D1Database,
+    private readonly kv: KVLike,
+  ) {
+    super(db);
+  }
+
+  /**
+   * Upload a binary brand asset (logo / intro / outro …) into the
+   * BRAND_ASSETS KV namespace and register its metadata in D1.
+   * Returns the KV key (`{userId}/{type}/{uuid}.{ext}`).
+   */
+  async uploadAsset(userId: string, file: File, assetType: string): Promise<string> {
+    if (!VALID_ASSET_TYPES.includes(assetType as AssetType)) {
+      throw new InvalidAssetTypeError(assetType);
+    }
+    if (file.size > MAX_LOGO_SIZE_BYTES) throw new BrandAssetTooLargeError(file.size);
+
+    const ext = (file.name.split('.').pop() || 'bin').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const uuid = crypto.randomUUID();
+    const key = `${userId}/${assetType}/${uuid}.${ext}`;
+    await this.kv.put(key, await file.arrayBuffer());
+
+    await this.addAsset(userId, {
+      asset_type: assetType as AssetType,
+      asset_name: file.name || key,
+      asset_url: key,
+      asset_meta: { size: file.size, mime: file.type },
+    });
+    return key;
+  }
+
+  /**
+   * Make `name` the active profile: the current "default" (if different)
+   * is renamed to `archived-<timestamp>` and the target becomes "default".
+   */
+  async setActiveProfile(userId: string, name: string): Promise<void> {
+    const target = await this.getProfile(userId, name);
+    if (!target) throw new BrandProfileNotFoundError(userId, name);
+    if (name === 'default') return;
+
+    const current = await this.getProfile(userId, 'default');
+    const now = nowSeconds();
+    if (current && current.id !== target.id) {
+      await this.db
+        .prepare('UPDATE brand_profiles SET name = ?, updated_at = ? WHERE id = ?')
+        .bind(`archived-${now}`, now, current.id)
+        .run();
+    }
+    await this.db
+        .prepare('UPDATE brand_profiles SET name = ?, updated_at = ? WHERE id = ?')
+        .bind('default', now, target.id)
+        .run();
+  }
+}
+
+const THROWING_KV: KVLike = {
+  async put(): Promise<void> {
+    throw new Error('BRAND_ASSETS KV namespace is not bound — cannot upload brand assets.');
+  },
+};
+
+/** Factory used by bot handlers: returns the KV-backed manager (uploadAsset + setActiveProfile). */
+export function createBrandProfileManager(
+  env: { DB: D1Database; BRAND_ASSETS?: KVLike },
+): KVBackedBrandProfileManager {
+  return new KVBackedBrandProfileManager(env.DB, env.BRAND_ASSETS ?? THROWING_KV);
 }

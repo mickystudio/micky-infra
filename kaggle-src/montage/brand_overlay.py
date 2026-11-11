@@ -1,28 +1,19 @@
-"""
-Brand overlay (Task B13 — brand_profile + montage integration).
+"""Brand overlay (Task B13-retry — brand_profile + montage integration).
 
 Applies a user's brand identity (logo watermark, brand colours, brand
-fonts, intro/outro pre-roll) to a finished montage video.
-
-The brand profile dict comes from the Worker's D1 row (serialised to JSON,
-posted to the Kaggle runner alongside the montage task spec):
-    {"name","logo_url","color_primary","color_secondary","color_accent",
-     "font_primary","font_secondary","intro_video_url","outro_video_url",
-     "watermark_position","watermark_opacity","default_platform","default_style"}
-
-A NULL/missing brand profile makes the montage pipeline run brandless
-(`pipeline.run_pipeline(..., options={'brand_profile': None})`).
+fonts, intro/outro pre-roll) to a finished montage video.  The brand
+profile dict comes from the Worker's D1 row.  If `brand_profile` is
+None/empty, every method returns its input unchanged (no-op).
 
 Public surface:
-    BrandOverlay(brand_profile: dict)
-        .apply_brand_to_video(video_path) -> str
-        .apply_watermark(video_path)     -> str
-        .apply_intro_outro(video_path)   -> str
-        .restyle_captions(ass_path)      -> str
-    fetch_brand_asset(url, cache_dir=...) -> str | None
-    brand_overlay_from_dict(brand_profile) -> BrandOverlay | None
-
-Created: 2026-11-13 (Task B13)
+    @dataclass BrandProfile        (Python mirror of the TS interface)
+    class BrandOverlay
+        .apply_brand_to_video(video_path) -> str   (watermark + intro/outro)
+        .apply_watermark(video_path)     -> str   (FFmpeg overlay)
+        .apply_intro_outro(video_path)   -> str   (FFmpeg concat)
+        .restyle_captions(ass_path)      -> str   (pysubs2 ASS rewrite)
+    brand_overlay_from_dict(profile) -> BrandOverlay | None
+Created: 2026-11-13 (Task B13-retry)
 """
 from __future__ import annotations
 
@@ -31,202 +22,176 @@ import re
 import subprocess
 import tempfile
 import urllib.request
-from typing import Any
+from dataclasses import dataclass, fields
+from typing import Any, Optional
 
-# Local imports (Kaggle montage package)
 try:
-    from ass_builder import CaptionConfig, ASSBuilder, hex_to_ass_color  # noqa: F401
-    _ASS_AVAILABLE = True
+    import pysubs2  # type: ignore  (declared in requirements.txt, B5)
+    _PYSUBS2_AVAILABLE = True
 except ImportError:  # pragma: no cover
-    _ASS_AVAILABLE = False
+    _PYSUBS2_AVAILABLE = False
 
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-_DEFAULT_LOGO_PADDING = 16         # px from the edge
-_DEFAULT_LOGO_TARGET_HEIGHT = 120   # px — logo is scaled to this height (width = aspect * h)
-_WATERMARK_PRESETS = {
-    # position → (overlay_x_expr, overlay_y_expr)
+# ============ Constants ============
+
+_LOGO_TARGET_HEIGHT = 120   # px — logo is scaled to this height
+_WATERMARK_PRESETS: dict[str, tuple[str, str]] = {
     # FFmpeg overlay x/y accept expressions like W-w-16
-    'top-left':      ('16',     '16'),
-    'top-right':     ('W-w-16', '16'),
-    'bottom-left':   ('16',     'H-h-16'),
-    'bottom-right':  ('W-w-16', 'H-h-16'),
-    'center':        ('(W-w)/2', '(H-h)/2'),
+    'top-left':     ('16',       '16'),
+    'top-right':    ('W-w-16',   '16'),
+    'bottom-left':  ('16',       'H-h-16'),
+    'bottom-right': ('W-w-16',   'H-h-16'),
+    'center':       ('(W-w)/2',  '(H-h)/2'),
 }
-
-_KV_URL_RE = re.compile(r'^kv://brand-assets/([^/]+)/([^/]+)/([^/]+)$')
 _HEX_RE = re.compile(r'^#?[0-9A-Fa-f]{6}$')
+_COLOR_TAG_RE = re.compile(r'\\([12])c&H[0-9A-Fa-f]{6,8}&?')
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def _normalize_hex(h: str | None) -> str | None:
-    """Return '#RRGGBB' or None.  Raises on malformed non-empty input."""
-    if h is None or h == '':
-        return None
+# ============ BrandProfile dataclass ============
+
+@dataclass
+class BrandProfile:
+    """Python mirror of `worker/src/core/brand_profile.ts:BrandProfile`.
+    Fields default to empty/None so partial D1 dicts still construct
+    valid profiles; `from_dict(...)` filters unknown keys."""
+    id: int = 0
+    user_id: str = ''
+    name: str = 'default'
+    logo_url: Optional[str] = None
+    color_primary: Optional[str] = None
+    color_secondary: Optional[str] = None
+    color_accent: Optional[str] = None
+    font_primary: Optional[str] = None
+    font_secondary: Optional[str] = None
+    intro_video_url: Optional[str] = None
+    outro_video_url: Optional[str] = None
+    watermark_position: str = 'bottom-right'
+    watermark_opacity: float = 0.3
+    default_platform: str = 'tiktok'
+    default_style: str = 'bold_pop'
+    created_at: int = 0
+    updated_at: int = 0
+
+    @classmethod
+    def from_dict(cls, d: Optional[dict[str, Any]]) -> Optional['BrandProfile']:
+        """Build from a (possibly None) dict, ignoring unknown keys.
+        Returns None when `d` is None/empty."""
+        if not d:
+            return None
+        valid = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in valid})
+
+
+# ============ Helpers ============
+
+def _normalize_hex(h: Optional[str]) -> Optional[str]:
+    """Return '#RRGGBB' (uppercase) or None.  Silently drops malformed colours."""
+    if not h: return None
     s = str(h).strip()
-    if not s.startswith('#'):
-        s = '#' + s
-    if not _HEX_RE.match(s):
-        raise ValueError(f'invalid hex colour: {h!r}')
+    if not s.startswith('#'): s = '#' + s
+    if not _HEX_RE.match(s): return None
     return s.upper()
 
 
-def _hex_to_ass(h: str | None) -> str | None:
-    """'#RRGGBB' → '&H00BBGGRR' (ASS BGR).  None passthrough."""
+def _hex_to_ass(h: Optional[str]) -> Optional[str]:
+    """'#RRGGBB' → '&H00BBGGRR' (ASS BGR colour).  None passthrough."""
     norm = _normalize_hex(h)
-    if norm is None:
-        return None
+    if norm is None: return None
     r, g, b = int(norm[1:3], 16), int(norm[3:5], 16), int(norm[5:7], 16)
     return f'&H00{b:02X}{g:02X}{r:02X}'
 
 
-def _ffprobe_duration(path: str) -> float:
-    """Probe video duration via ffprobe (returns seconds, 0.0 on error)."""
+def _coerce_opacity(raw: Any, default: float = 0.3) -> float:
+    """Clamp an arbitrary value to [0.0, 1.0]."""
     try:
-        out = subprocess.check_output(
-            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-             '-of', 'default=noprint_wrappers=1:nokey=1', path],
-            stderr=subprocess.STDOUT,
-        )
-        return float(out.decode().strip() or 0.0)
-    except Exception:
-        return 0.0
+        n = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, min(1.0, n))
 
 
-def fetch_brand_asset(url: str, cache_dir: str = '/tmp/micky-brand-assets') -> str | None:
-    """Resolve a brand-asset URL to a local file path.
+def _coerce_position(raw: Any) -> str:
+    s = str(raw or '').lower()
+    return s if s in _WATERMARK_PRESETS else 'bottom-right'
 
-    Supports:
-      * `kv://brand-assets/{userId}/{type}/{uuid}` — fetches the binary
-        from the Worker's BRAND_ASSETS KV namespace via the public
-        `/brand/asset?key=...` endpoint (TODO: B14 will add this route;
-        until then, falls back to None and the watermark is skipped).
-      * `https://...` / `http://...` — downloads to cache_dir.
-      * local filesystem path — returned as-is.
 
-    Returns the local file path, or None if the asset couldn't be fetched
-    (in which case the caller should skip the overlay step gracefully).
-    """
-    if not url:
+def _fetch_asset(url: str, cache_dir: str = '/tmp/micky-brand-assets') -> Optional[str]:
+    """Resolve a brand-asset URL to a local file path.  Supports
+    `http(s)://...` URLs (downloaded to `cache_dir`) and local
+    filesystem paths (returned as-is).  Returns None on failure."""
+    if not url: return None
+    if os.path.exists(url): return url
+    if not (url.startswith('http://') or url.startswith('https://')): return None
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_name = url.split('/')[-1].split('?')[0] or 'brand_asset'
+    cache_path = os.path.join(cache_dir, cache_name)
+    try:
+        urllib.request.urlretrieve(url, cache_path)
+        return cache_path
+    except Exception as e:
+        print(f'[brand_overlay] ⚠️  fetch failed ({url}): {e}')
         return None
 
-    # Local path?
-    if os.path.exists(url):
-        return url
 
-    # KV URL? — would require the Worker to expose a /brand/asset endpoint.
-    if url.startswith('kv://'):
-        m = _KV_URL_RE.match(url)
-        if not m:
-            return None
-        # The Worker doesn't expose /brand/asset yet (B14 will add it).
-        # We accept an environment override MICKY_WORKER_URL so tests can
-        # point at a dev Worker that does serve the binary.
-        worker_url = os.environ.get('MICKY_WORKER_URL')
-        if not worker_url:
-            print(f'[brand_overlay] ⚠️  KV asset {url} not fetchable '
-                  f'(set MICKY_WORKER_URL or use a direct https:// URL); skipping.')
-            return None
-        cache_path = os.path.join(cache_dir, url.replace('kv://', '').replace('/', '_'))
-        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        direct_url = f'{worker_url.rstrip("/")}/brand/asset?key={url}'
-        try:
-            urllib.request.urlretrieve(direct_url, cache_path)
-            return cache_path
-        except Exception as e:
-            print(f'[brand_overlay] ⚠️  KV fetch failed ({e}); skipping.')
-            return None
-
-    # HTTPS URL
-    if url.startswith('http://') or url.startswith('https://'):
-        os.makedirs(cache_dir, exist_ok=True)
-        cache_path = os.path.join(cache_dir, url.split('/')[-1].split('?')[0] or 'brand_asset')
-        try:
-            urllib.request.urlretrieve(url, cache_path)
-            return cache_path
-        except Exception as e:
-            print(f'[brand_overlay] ⚠️  HTTP fetch failed ({e}); skipping.')
-            return None
-
-    return None
+def _sibling(path: str, suffix: str) -> str:
+    """Return `<dir>/<basename>_<suffix>.<ext>` next to `path`."""
+    root, ext = os.path.splitext(path)
+    return f'{root}{suffix}{ext}'
 
 
-# ---------------------------------------------------------------------------
-# BrandOverlay
-# ---------------------------------------------------------------------------
+# ============ BrandOverlay ============
+
 class BrandOverlay:
-    """Apply a brand identity (logo watermark + brand-coloured captions
-    + intro/outro pre-roll) to a montage video.
+    """Apply a brand identity (logo watermark + brand-coloured captions +
+    intro/outro pre-roll) to a montage video.
 
-    Construction is cheap; actual FFmpeg work happens in the `apply_*`
-    methods.  Each method writes its output next to the input video with
-    a `_branded` / `_wm` / `_intro` suffix and returns the new path.
+    Construction is cheap; FFmpeg / pysubs2 work happens in the
+    `apply_*` methods.  Each method writes its output next to the input
+    with a `_wm` / `_intro` / `_brand` suffix and returns the new path.
+    Fail-soft: any error is logged and the original input is returned
+    unchanged so the pipeline never crashes."""
 
-    The class is designed to fail soft: any FFmpeg / download error is
-    logged and the original `video_path` is returned unchanged so the
-    pipeline never crashes on a brand-application hiccup.
-    """
-
-    def __init__(self, brand_profile: dict):
+    def __init__(self, brand_profile: dict[str, Any]):
+        if brand_profile is None:
+            raise TypeError('brand_profile must be a dict (got None)')
         if not isinstance(brand_profile, dict):
             raise TypeError(f'brand_profile must be dict, got {type(brand_profile).__name__}')
-        self.profile = brand_profile
-        self.name = brand_profile.get('name', 'default')
-        self.logo_url = brand_profile.get('logo_url')
-        self.color_primary = _normalize_hex(brand_profile.get('color_primary'))
-        self.color_secondary = _normalize_hex(brand_profile.get('color_secondary'))
-        self.color_accent = _normalize_hex(brand_profile.get('color_accent'))
-        self.font_primary = brand_profile.get('font_primary') or 'Anton'
-        self.font_secondary = brand_profile.get('font_secondary') or 'Cairo'
-        self.intro_url = brand_profile.get('intro_video_url')
-        self.outro_url = brand_profile.get('outro_video_url')
-        pos = str(brand_profile.get('watermark_position') or 'bottom-right').lower()
-        self.watermark_position = pos if pos in _WATERMARK_PRESETS else 'bottom-right'
-        try:
-            op = float(brand_profile.get('watermark_opacity', 0.3))
-        except (TypeError, ValueError):
-            op = 0.3
-        self.watermark_opacity = max(0.0, min(1.0, op))
-
-    # ------------------------------------------------------------------
-    # Convenience: do we have anything brand-y to apply?
-    # ------------------------------------------------------------------
-    @property
-    def has_logo(self) -> bool:
-        return bool(self.logo_url)
+        self.profile: BrandProfile = BrandProfile.from_dict(brand_profile) or BrandProfile()
+        self.logo_url = self.profile.logo_url
+        self.color_primary = _normalize_hex(self.profile.color_primary)
+        self.color_secondary = _normalize_hex(self.profile.color_secondary)
+        self.color_accent = _normalize_hex(self.profile.color_accent)
+        self.font_primary = self.profile.font_primary or 'Anton'
+        self.font_secondary = self.profile.font_secondary or 'Cairo'
+        self.intro_url = self.profile.intro_video_url
+        self.outro_url = self.profile.outro_video_url
+        self.watermark_position = _coerce_position(self.profile.watermark_position)
+        self.watermark_opacity = _coerce_opacity(self.profile.watermark_opacity)
 
     @property
-    def has_intro(self) -> bool:
-        return bool(self.intro_url)
-
+    def has_logo(self) -> bool: return bool(self.logo_url)
     @property
-    def has_outro(self) -> bool:
-        return bool(self.outro_url)
-
+    def has_intro(self) -> bool: return bool(self.intro_url)
+    @property
+    def has_outro(self) -> bool: return bool(self.outro_url)
     @property
     def has_brand_colors(self) -> bool:
         return any([self.color_primary, self.color_secondary, self.color_accent])
+    @property
+    def has_brand_content(self) -> bool:
+        """True if the profile contains anything to apply."""
+        return self.has_logo or self.has_intro or self.has_outro or self.has_brand_colors
 
-    # ------------------------------------------------------------------
-    # Top-level: apply everything in order
-    # ------------------------------------------------------------------
+    # -- top-level entry --
+
     def apply_brand_to_video(self, video_path: str) -> str:
-        """Apply watermark + intro/outro + (optional) caption restyle.
-
-        Order: intro/outro concat → watermark overlay → caption restyle
-        (caption restyle is a no-op here because the .ass is typically
-        burned in *before* this method is called — see pipeline.py).
-
-        Returns the final branded video path (or `video_path` itself if
-        nothing could be applied).
-        """
-        if not os.path.exists(video_path):
-            raise FileNotFoundError(video_path)
-
+        """Apply watermark + intro/outro to `video_path`.  Caption restyle
+        is separate (see `restyle_captions`).  Returns the final branded
+        video path (or `video_path` itself if nothing could be applied)."""
+        if not self.has_brand_content:
+            return video_path
+        if not video_path or not os.path.exists(video_path):
+            return video_path
         out = video_path
         try:
             if self.has_intro or self.has_outro:
@@ -234,167 +199,109 @@ class BrandOverlay:
             if self.has_logo:
                 out = self.apply_watermark(out)
         except Exception as e:
-            print(f'[brand_overlay] ⚠️  apply_brand_to_video failed at '
-                  f'some step ({e}); returning best-effort path {out}')
+            print(f'[brand_overlay] ⚠️  apply_brand_to_video failed ({e}); '
+                  f'returning best-effort path {out}')
         return out
 
-    # ------------------------------------------------------------------
-    # Watermark
-    # ------------------------------------------------------------------
+    # -- watermark --------------------------------------------------------
+
     def apply_watermark(self, video_path: str) -> str:
         """Overlay the brand logo at the configured position with the
-        configured opacity.
-
-        FFmpeg filter graph (default bottom-right, opacity 0.3):
-            [0:v][1:v]overlay=W-w-16:H-h-16:format=auto,
-            colorchannelmixer=aa=0.3[v]
-
-        The logo is first scaled to a fixed height (default 120 px) so a
-        4K logo image doesn't dominate the frame.  PNGs with alpha are
-        supported; JPEGs get a hard alpha (no transparency).
-        """
+        configured opacity.  Logo is scaled to a fixed 120-px height.
+        PNGs with alpha supported; JPEGs get hard alpha."""
         if not self.has_logo:
             return video_path
-
-        logo_local = fetch_brand_asset(self.logo_url)
-        if logo_local is None or not os.path.exists(logo_local):
+        logo_local = _fetch_asset(self.logo_url or '')
+        if not logo_local or not os.path.exists(logo_local):
             print(f'[brand_overlay] ⚠️  logo not fetchable ({self.logo_url}); skipping watermark.')
             return video_path
 
-        out_path = self._sibling(video_path, '_wm')
+        out_path = _sibling(video_path, '_wm')
         x_expr, y_expr = _WATERMARK_PRESETS[self.watermark_position]
         opacity = self.watermark_opacity
-        # FFmpeg's colorchannelmixer `aa` is the alpha multiplier — 0..1.
-        # For opacity=1 we skip the mixer entirely (faster).
-        scale_filter = f"scale=-2:{_DEFAULT_LOGO_TARGET_HEIGHT}:force_original_aspect_ratio=decrease"
-
+        scale = f'scale=-2:{_LOGO_TARGET_HEIGHT}:force_original_aspect_ratio=decrease'
         if opacity >= 1.0:
-            filter_complex = (
-                f"[1:v]{scale_filter}[logo];"
-                f"[0:v][logo]overlay={x_expr}:{y_expr}:format=auto[v]"
-            )
+            fc = f'[1:v]{scale}[logo];[0:v][logo]overlay={x_expr}:{y_expr}:format=auto[v]'
         else:
-            filter_complex = (
-                f"[1:v]{scale_filter},format=rgba,"
-                f"colorchannelmixer=aa={opacity:.3f}[logo];"
-                f"[0:v][logo]overlay={x_expr}:{y_expr}:format=auto[v]"
-            )
-
+            fc = (f'[1:v]{scale},format=rgba,colorchannelmixer=aa={opacity:.3f}[logo];'
+                  f'[0:v][logo]overlay={x_expr}:{y_expr}:format=auto[v]')
         cmd = [
             'ffmpeg', '-y', '-loglevel', 'error',
-            '-i', video_path,
-            '-i', logo_local,
-            '-filter_complex', filter_complex,
-            '-map', '[v]',
-            '-map', '0:a?',
+            '-i', video_path, '-i', logo_local,
+            '-filter_complex', fc,
+            '-map', '[v]', '-map', '0:a?',
             '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
-            '-c:a', 'copy',
-            '-movflags', '+faststart',
-            out_path,
+            '-c:a', 'copy', '-movflags', '+faststart', out_path,
         ]
         try:
             subprocess.run(cmd, check=True, capture_output=True)
-            print(f'[brand_overlay] ✅ Watermark applied → {out_path}')
+            print(f'[brand_overlay] ✅ watermark applied → {out_path}')
             return out_path
         except subprocess.CalledProcessError as e:
             print(f'[brand_overlay] ⚠️  ffmpeg watermark failed: '
                   f'{e.stderr.decode(errors="replace")[:400]}')
             return video_path
 
-    # ------------------------------------------------------------------
-    # Intro / outro concat
-    # ------------------------------------------------------------------
+    # -- intro / outro concat --
+
     def apply_intro_outro(self, video_path: str) -> str:
         """Concatenate intro + main video + outro into a single MP4.
 
         Uses the FFmpeg `concat` demuxer with a temporary file list.
-        The intro/outro are re-encoded to match the main video's codec
-        (libx264 + AAC) so concat doesn't fail on codec mismatches.
-        """
+        Intro/outro segments are re-encoded to libx264 + AAC so the
+        concat demuxer's `-c copy` path works even when sources have
+        different codecs."""
         if not (self.has_intro or self.has_outro):
             return video_path
 
         segments: list[str] = []
-        # Intro
-        if self.has_intro:
-            intro_local = fetch_brand_asset(self.intro_url)
-            if intro_local and os.path.exists(intro_local):
-                segments.append(self._normalize_segment(intro_local, 'intro', video_path))
+        for label, url, has in [('intro', self.intro_url, self.has_intro),
+                                 ('outro', self.outro_url, self.has_outro)]:
+            if not has:
+                continue
+            local = _fetch_asset(url or '')
+            if local and os.path.exists(local):
+                segments.append(self._normalize_segment(local, label, video_path))
             else:
-                print(f'[brand_overlay] ⚠️  intro not fetchable ({self.intro_url}); skipping intro.')
-
-        # Main video (normalize so the concat demuxer is happy)
-        segments.append(self._normalize_segment(video_path, 'main', video_path))
-
-        # Outro
-        if self.has_outro:
-            outro_local = fetch_brand_asset(self.outro_url)
-            if outro_local and os.path.exists(outro_local):
-                segments.append(self._normalize_segment(outro_local, 'outro', video_path))
-            else:
-                print(f'[brand_overlay] ⚠️  outro not fetchable ({self.outro_url}); skipping outro.')
-
+                print(f'[brand_overlay] ⚠️  {label} not fetchable ({url}); skipping.')
+        segments.append(video_path)  # main video kept as-is
         if len(segments) < 2:
-            # Nothing to concat (intro+outro both missing).
-            return video_path
+            return video_path  # nothing to concat
 
-        # Write the concat list (one path per line, quoted).
         list_fd, list_path = tempfile.mkstemp(suffix='.txt', prefix='brand_concat_')
+        out_path = _sibling(video_path, '_intro')
         try:
             with os.fdopen(list_fd, 'w') as f:
                 for seg in segments:
                     f.write(f"file '{seg}'\n")
-
-            out_path = self._sibling(video_path, '_intro')
-            cmd = [
-                'ffmpeg', '-y', '-loglevel', 'error',
-                '-f', 'concat', '-safe', '0',
-                '-i', list_path,
-                '-c', 'copy',
-                '-movflags', '+faststart',
-                out_path,
-            ]
-            # copy-mode concat requires identical codecs; if it fails,
-            # fall back to re-encoding.
+            # Try copy-mode concat first (fast); fall back to re-encode.
+            base = ['ffmpeg', '-y', '-loglevel', 'error', '-f', 'concat',
+                    '-safe', '0', '-i', list_path, '-movflags', '+faststart']
+            copy_cmd = base + ['-c', 'copy', out_path]
+            reenc_cmd = base + ['-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+                                '-c:a', 'aac', '-b:a', '192k', out_path]
             try:
-                subprocess.run(cmd, check=True, capture_output=True)
+                subprocess.run(copy_cmd, check=True, capture_output=True)
             except subprocess.CalledProcessError:
-                cmd_reenc = [
-                    'ffmpeg', '-y', '-loglevel', 'error',
-                    '-f', 'concat', '-safe', '0',
-                    '-i', list_path,
-                    '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
-                    '-c:a', 'aac', '-b:a', '192k',
-                    '-movflags', '+faststart',
-                    out_path,
-                ]
-                subprocess.run(cmd_reenc, check=True, capture_output=True)
-            print(f'[brand_overlay] ✅ Intro/outro concat → {out_path}')
+                subprocess.run(reenc_cmd, check=True, capture_output=True)
+            print(f'[brand_overlay] ✅ intro/outro concat → {out_path}')
             return out_path
         except subprocess.CalledProcessError as e:
             print(f'[brand_overlay] ⚠️  intro/outro concat failed: '
                   f'{e.stderr.decode(errors="replace")[:400]}')
             return video_path
         finally:
-            try:
-                os.unlink(list_path)
-            except OSError:
-                pass
+            try: os.unlink(list_path)
+            except OSError: pass
 
     def _normalize_segment(self, src_path: str, label: str, ref_video: str) -> str:
-        """Re-encode an intro/outro to match the main video's resolution
-        + codec so the concat demuxer's `-c copy` path works.  The main
-        video itself is returned as-is (no re-encode)."""
-        if label == 'main':
-            return src_path
-        out = self._sibling(ref_video, f'_{label}')
+        """Re-encode an intro/outro clip to libx264 + AAC so the concat
+        demuxer's `-c copy` path works."""
+        out = _sibling(ref_video, f'_{label}')
         cmd = [
-            'ffmpeg', '-y', '-loglevel', 'error',
-            '-i', src_path,
+            'ffmpeg', '-y', '-loglevel', 'error', '-i', src_path,
             '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
-            '-c:a', 'aac', '-b:a', '192k',
-            '-movflags', '+faststart',
-            out,
+            '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', out,
         ]
         try:
             subprocess.run(cmd, check=True, capture_output=True)
@@ -402,151 +309,71 @@ class BrandOverlay:
         except subprocess.CalledProcessError as e:
             print(f'[brand_overlay] ⚠️  _normalize_segment({label}) failed: '
                   f'{e.stderr.decode(errors="replace")[:400]}')
-            return src_path  # best-effort: concat will likely fail downstream
+            return src_path  # best-effort
 
-    # ------------------------------------------------------------------
-    # Caption restyle
-    # ------------------------------------------------------------------
+    # -- caption restyle (pysubs2) --
+
     def restyle_captions(self, ass_path: str) -> str:
-        """Rewrite an .ass file with the brand's primary/secondary
-        colours and primary font.
+        """Rewrite an .ass file with the brand's primary/secondary colours
+        and primary font, using `pysubs2` for parse/serialise.
 
-        The approach is text-based — we parse the .ass line-by-line:
-          1. Find `Style:` lines under [V4+ Styles] and rewrite:
-             - Fontname → brand font_primary
-             - PrimaryColour → brand color_primary (ASS BGR)
-             - SecondaryColour → brand color_secondary (or accent)
-          2. Find Dialogue lines and rewrite any `\\1c` / `\\2c` inline
-             colour tags so the kinetic caption generator's per-word
-             pop-in colour is replaced with the brand accent.
+          * Every Style: Fontname → brand font_primary, PrimaryColour →
+            brand color_primary (ASS BGR), SecondaryColour → brand
+            color_secondary (or accent).
+          * Every Dialogue event: replace the FIRST inline `\\1c` / `\\2c`
+            override tag with the brand primary / secondary colours.
 
-        If the .ass file is missing or the brand has no colour overrides,
-        returns `ass_path` unchanged.
+        Returns the restyled .ass path (`<base>_brand.ass`), or the
+        original `ass_path` if there was nothing to restyle or pysubs2
+        is unavailable.
         """
-        if not ass_path or not os.path.exists(ass_path):
-            return ass_path
-        if not self.has_brand_colors:
-            return ass_path
-        if not _ASS_AVAILABLE:
-            print('[brand_overlay] ⚠️  ass_builder not importable; skipping caption restyle.')
+        if not ass_path or not os.path.exists(ass_path): return ass_path
+        if not self.has_brand_colors: return ass_path
+        if not _PYSUBS2_AVAILABLE:
+            print('[brand_overlay] ⚠️  pysubs2 not installed; skipping caption restyle.')
             return ass_path
 
         primary_ass = _hex_to_ass(self.color_primary) or '&H00FFFFFF'
-        # Secondary prefers the explicit secondary colour, then the accent.
-        secondary_ass = (
-            _hex_to_ass(self.color_secondary)
-            or _hex_to_ass(self.color_accent)
-            or '&H000000FF'
-        )
-
+        secondary_ass = (_hex_to_ass(self.color_secondary)
+                         or _hex_to_ass(self.color_accent) or '&H000000FF')
         try:
-            with open(ass_path, 'r', encoding='utf-8-sig') as f:
-                lines = f.readlines()
+            subs = pysubs2.load(ass_path)
         except Exception as e:
-            print(f'[brand_overlay] ⚠️  cannot read .ass ({e}); skipping restyle.')
+            print(f'[brand_overlay] ⚠️  pysubs2 cannot read .ass ({e}); skipping restyle.')
             return ass_path
-
-        in_styles = False
-        out_lines: list[str] = []
-        for ln in lines:
-            stripped = ln.strip()
-
-            # Track section context.
-            if stripped.startswith('[') and stripped.endswith(']'):
-                in_styles = stripped.lower().startswith('[v4+ styles]')
-                out_lines.append(ln)
-                continue
-
-            # Rewrite the Style: line.
-            if in_styles and stripped.startswith('Style:'):
-                ln = self._rewrite_style_line(ln, primary_ass, secondary_ass)
-                out_lines.append(ln)
-                continue
-
-            # Rewrite per-word \\1c tags in Dialogue lines.
-            if stripped.startswith('Dialogue:'):
-                ln = self._rewrite_dialogue_colors(ln, primary_ass, secondary_ass)
-                out_lines.append(ln)
-                continue
-
-            out_lines.append(ln)
-
-        out_path = self._sibling(ass_path, '_brand')
+        # 1) Rewrite Style lines (fontname + primary + secondary).
+        for style in subs.styles.values():
+            style.fontname = self.font_primary
+            style.primarycolor = primary_ass
+            style.secondarycolor = secondary_ass
+        # 2) Replace the first \\1c / \\2c inline colour tags on each Dialogue line.
+        for ev in subs.events:
+            if ev.text:
+                ev.text = self._rewrite_inline_colors(ev.text, primary_ass, secondary_ass)
+        out_path = _sibling(ass_path, '_brand')
         try:
-            with open(out_path, 'w', encoding='utf-8') as f:
-                f.writelines(out_lines)
-            # Preserve the BOM (libass-friendly) — ass_builder does this too.
-            print(f'[brand_overlay] ✅ Caption restyle → {out_path}')
+            subs.save(out_path)
+            print(f'[brand_overlay] ✅ caption restyle → {out_path}')
             return out_path
         except Exception as e:
-            print(f'[brand_overlay] ⚠️  failed writing restyled .ass ({e}).')
+            print(f'[brand_overlay] ⚠️  pysubs2 save failed ({e}); keeping original .ass.')
             return ass_path
 
-    def _rewrite_style_line(
-        self, line: str, primary_ass: str, secondary_ass: str,
-    ) -> str:
-        """Rewrite Fontname / PrimaryColour / SecondaryColour fields
-        on a `Style:` line.  ASS Style line format:
-            Style: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,...
-        """
-        if not line.lstrip().startswith('Style:'):
-            return line
-        prefix, _, rest = line.partition(':')
-        parts = rest.split(',')
-        if len(parts) < 7:
-            return line
-        # parts[0] = Name (keep), parts[1] = Fontname, parts[2] = Fontsize,
-        # parts[3] = PrimaryColour, parts[4] = SecondaryColour
-        parts[1] = self.font_primary
-        parts[3] = primary_ass
-        parts[4] = secondary_ass
-        return f'{prefix}:' + ','.join(parts)
-
-    def _rewrite_dialogue_colors(
-        self, line: str, primary_ass: str, secondary_ass: str,
-    ) -> str:
-        """Rewrite \\1c and \\2c inline colour tags on a Dialogue line
-        so the kinetic per-word pop-in colour matches the brand.
-
-        ASS override tags: `\\1c&H00BBGGRR&` (primary) and `\\2c&H...&`
-        (secondary).  We only replace the *first* occurrence of each —
-        the kinetic caption generator emits one header tag per chunk
-        that sets both colours for all words on that chunk.
-
-        The closing `&` is optional in libass; we match both forms.
-
-        Implementation note: we use a lambda for the replacement so
-        that backslashes in `primary_ass` / `secondary_ass` aren't
-        interpreted as regex group references by `re.sub`.
-        """
-        # Replace only the first \\1c and \\2c on the line — kinetic
-        # caption style sheets emit these once per chunk for all words.
-        new = re.sub(
-            r'\\1c&H[0-9A-Fa-f]{8}&?',
-            lambda _m, repl=primary_ass: f'\\1c{repl}',
-            line, count=1,
-        )
-        new = re.sub(
-            r'\\2c&H[0-9A-Fa-f]{8}&?',
-            lambda _m, repl=secondary_ass: f'\\2c{repl}',
-            new, count=1,
-        )
-        return new
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
     @staticmethod
-    def _sibling(path: str, suffix: str) -> str:
-        """Return `<dir>/<basename>_<suffix>.<ext>` next to `path`."""
-        root, ext = os.path.splitext(path)
-        return f'{root}{suffix}{ext}'
+    def _rewrite_inline_colors(text: str, primary_ass: str, secondary_ass: str) -> str:
+        """Replace the first `\\1c&H...` / `\\2c&H...` inline colour tags in
+        `text` with the brand colours.  Other override tags (\\fad, \\pos,
+        \\kf, …) are preserved.  Lambda form avoids re.sub's regex
+        group-reference escaping on `&H00...` literals."""
+        return _COLOR_TAG_RE.sub(
+            lambda m: f'\\{m.group(1)}c{primary_ass if m.group(1) == "1" else secondary_ass}',
+            text, count=1,
+        )
 
 
-# ---------------------------------------------------------------------------
-# Convenience: build a BrandOverlay from a dict (or None-safe)
-# ---------------------------------------------------------------------------
-def brand_overlay_from_dict(brand_profile: dict | None) -> BrandOverlay | None:
+# ============ Convenience: None-safe constructor ============
+
+def brand_overlay_from_dict(brand_profile: Optional[dict[str, Any]]) -> Optional[BrandOverlay]:
     """Construct a BrandOverlay, or return None if `brand_profile` is
     falsy.  Pipeline callers use this to optionally apply branding."""
     if not brand_profile:
@@ -558,30 +385,15 @@ def brand_overlay_from_dict(brand_profile: dict | None) -> BrandOverlay | None:
         return None
 
 
-__all__ = [
-    'BrandOverlay',
-    'brand_overlay_from_dict',
-    'fetch_brand_asset',
-]
+__all__ = ['BrandProfile', 'BrandOverlay', 'brand_overlay_from_dict']
 
 
-# ---------------------------------------------------------------------------
-# Smoke test
-# ---------------------------------------------------------------------------
+# ============ Smoke test ============
 if __name__ == '__main__':  # pragma: no cover
-    profile = {
-        'name': 'default',
-        'logo_url': None,
-        'color_primary': '#FF5733',
-        'color_secondary': '#FFFFFF',
-        'color_accent': '#FFC300',
-        'font_primary': 'Cairo',
-        'watermark_position': 'bottom-right',
-        'watermark_opacity': 0.3,
-    }
+    profile = {'name': 'default', 'color_primary': '#FF5733', 'color_secondary': '#FFFFFF',
+              'color_accent': '#FFC300', 'font_primary': 'Cairo',
+              'watermark_position': 'bottom-right', 'watermark_opacity': 0.3}
     bo = BrandOverlay(profile)
-    print(f'BrandOverlay: {bo.name}')
-    print(f'  primary={bo.color_primary} → ASS {_hex_to_ass(bo.color_primary)}')
-    print(f'  secondary={bo.color_secondary} → ASS {_hex_to_ass(bo.color_secondary)}')
-    print(f'  has_logo={bo.has_logo} has_intro={bo.has_intro} has_outro={bo.has_outro}')
-    print(f'  has_brand_colors={bo.has_brand_colors}')
+    print(f'BrandOverlay: {bo.profile.name}; primary={bo.color_primary} has_brand_content={bo.has_brand_content}')
+    assert brand_overlay_from_dict(None) is None and brand_overlay_from_dict({}) is None
+    print('  brand_overlay_from_dict(None/empty) → None ✅')

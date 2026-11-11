@@ -125,7 +125,8 @@ export type ProviderId =
   | 'cohere'
   | 'siliconflow'
   | 'cerebras'
-  | 'novita';
+  | 'novita'
+  | 'gizmo';
 
 /** Runtime guard for {@link ProviderId}. */
 export function isProviderId(value: string): value is ProviderId {
@@ -140,7 +141,8 @@ export function isProviderId(value: string): value is ProviderId {
     value === 'cohere' ||
     value === 'siliconflow' ||
     value === 'cerebras' ||
-    value === 'novita'
+    value === 'novita' ||
+    value === 'gizmo'
   );
 }
 
@@ -157,6 +159,7 @@ export const PROVIDER_LABELS: Readonly<Record<ProviderId, string>> = Object.free
   siliconflow: 'SiliconFlow',
   cerebras: 'Cerebras Cloud',
   novita: 'Novita AI',
+  gizmo: 'Gizmo Platform (free models)',
 });
 
 // ============================================================================
@@ -185,6 +188,7 @@ export interface ProviderKeys {
   SILICONFLOW_KEY: string;
   CEREBRAS_KEY: string;
   NOVITA_KEY: string;
+  GIZMO_KEY: string;
 }
 
 /** Env shape every gateway function accepts. */

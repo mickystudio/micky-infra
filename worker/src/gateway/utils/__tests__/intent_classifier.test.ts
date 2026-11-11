@@ -265,42 +265,42 @@ describe('classifyIntent — simple_chat fallback', () => {
 describe('getCascadeForIntent', () => {
   it('returns the correct cascade for code', () => {
     expect(getCascadeForIntent('code')).toEqual([
-      'groq1', 'groq2', 'mistral', 'sambanova', 'siliconflow', 'workersai', 'cerebras',
+      'groq1', 'groq2', 'mistral', 'sambanova', 'siliconflow', 'workersai', 'cerebras', 'gizmo', 'openrouter',
     ]);
   });
 
   it('returns the correct cascade for arabic', () => {
     expect(getCascadeForIntent('arabic')).toEqual([
-      'groq1', 'groq2', 'cohere', 'sambanova', 'gemini',
+      'groq1', 'groq2', 'cohere', 'sambanova', 'gemini', 'gizmo', 'openrouter', 'workersai',
     ]);
   });
 
   it('returns the correct cascade for long_context', () => {
     expect(getCascadeForIntent('long_context')).toEqual([
-      'gemini', 'groq1', 'groq2', 'mistral',
+      'gemini', 'groq1', 'groq2', 'mistral', 'gizmo', 'openrouter', 'workersai',
     ]);
   });
 
   it('returns the correct cascade for reasoning', () => {
     expect(getCascadeForIntent('reasoning')).toEqual([
-      'groq1', 'groq2', 'sambanova', 'novita',
+      'groq1', 'groq2', 'sambanova', 'novita', 'gizmo', 'openrouter', 'workersai',
     ]);
   });
 
   it('returns the correct cascade for simple_chat', () => {
     expect(getCascadeForIntent('simple_chat')).toEqual([
-      'groq1', 'groq2', 'mistral', 'gemini', 'openrouter', 'workersai',
+      'groq1', 'groq2', 'mistral', 'gemini', 'gizmo', 'openrouter', 'workersai',
     ]);
   });
 
   it('returns the correct cascade for tool_calling', () => {
     expect(getCascadeForIntent('tool_calling')).toEqual([
-      'groq1', 'groq2', 'mistral', 'openrouter', 'gemini',
+      'groq1', 'groq2', 'mistral', 'openrouter', 'gemini', 'workersai',
     ]);
   });
 
   it('returns the correct cascade for multimodal', () => {
-    expect(getCascadeForIntent('multimodal')).toEqual(['gemini']);
+    expect(getCascadeForIntent('multimodal')).toEqual(['gemini', 'openrouter', 'workersai']);
   });
 
   it('returns a fresh array each call (no shared mutation)', () => {
@@ -326,8 +326,8 @@ describe('pickBestModel', () => {
     expect(pickBestModel('simple_chat', 'groq1')).toBe('llama-3.1-8b-instant');
   });
 
-  it('picks gemini-2.0-flash for multimodal + gemini', () => {
-    expect(pickBestModel('multimodal', 'gemini')).toBe('gemini-2.0-flash');
+  it('picks gemini-3.8-flash for multimodal + gemini', () => {
+    expect(pickBestModel('multimodal', 'gemini')).toBe('gemini-3.8-flash');
   });
 
   it('picks codestral-latest for code + mistral', () => {

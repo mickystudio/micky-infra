@@ -15,12 +15,13 @@
 
 import { processQueuedTask, type QueueMessage } from './core/queue_manager';
 import { handleScheduled } from './cron';
-// ============ Multi-provider LLM Gateway (Task A1-retry) ============
+// ============ Multi-provider LLM Gateway (Task A1-retry + A8-retry2) ============
 // The gateway module exposes `routeChat` (the OpenAI-compatible multi-provider
-// cascade entry point), `handleProviderFeedback` (thumbs-up/down for the
-// dashboard's per-provider analytics), and `getDashboardData` (snapshot of
-// every provider's health + quota for the /v1/dashboard route).
-import { routeChat, handleProviderFeedback } from './gateway';
+// cascade entry point — non-stream), `routeChatStream` (the streaming variant
+// — SSE), `handleProviderFeedback` (thumbs-up/down for the dashboard's
+// per-provider analytics), plus the registry's `listProviders` (used by the
+// /v1/providers route).
+import { routeChat, routeChatStream, handleProviderFeedback, listProviders } from './gateway';
 import { ProviderMonitor } from './gateway/monitoring';
 
 export interface Env {
@@ -71,6 +72,7 @@ export interface Env {
   SILICONFLOW_KEY: string;
   CEREBRAS_KEY: string;
   NOVITA_KEY: string;
+  GIZMO_KEY: string;
   // ============ B9: HF Spaces ZeroGPU + Modal serverless ============
   // All optional — if missing, dispatchToHFSpaces / dispatchToModal throw
   // informative errors and callers fall back to Kaggle.
@@ -79,6 +81,18 @@ export interface Env {
   MODAL_TOKEN_ID?: string;
   MODAL_TOKEN_SECRET?: string;
   MODAL_APP_NAME?: string;
+  // ============ B16: Audio library (Jamendo + Freesound) ============
+  // Optional — used by the montage pipeline's background-music selector.
+  // When missing, the audio library returns an empty list and the pipeline
+  // falls back to silence or a built-in cue track.
+  JAMENDO_CLIENT_ID?: string;
+  FREESOUND_TOKEN?: string;
+  // ============ Cloudflare account-level credentials (Media Transform + R2) ============
+  // Optional — used for server-side thumbnail generation + R2 storage of
+  // rendered videos. When missing, the worker falls back to in-pipeline
+  // ffmpeg thumbnail extraction + Telegram-hosted output URLs.
+  CF_ACCOUNT_ID?: string;
+  CF_API_TOKEN?: string;
 }
 
 // ============ Router ============
@@ -148,6 +162,16 @@ export default {
       // message. Used by the dashboard's per-provider quality metrics.
       if (path === '/v1/feedback' && method === 'POST') {
         return await handleFeedback(request, env);
+      }
+
+      // ============ BYOK: Provider List (Task A1-retry — Agent C5 addition) ============
+      // GET /v1/providers — returns the list of all 11 configured providers
+      // with their id / label / configured / healthy status. Read-only,
+      // best-effort: D1 ledger failures degrade to healthy='unknown' for
+      // every provider rather than erroring out. Useful as a lightweight
+      // health probe (vs. /v1/dashboard which is the heavier ops view).
+      if (path === '/v1/providers' && method === 'GET') {
+        return await handleProviderList(env);
       }
 
       // ============ BYOK: Provider Dashboard (Task A1-retry) ============
@@ -453,11 +477,19 @@ async function handleChatCompletions(
   // `ChatRole` union (`'system' | 'user' | 'assistant' | 'tool'`) but the
   // local `ChatCompletionRequest.messages[].role` is typed as `string` (we
   // validated it's one of the valid roles above, so the cast is safe).
+  //
+  // Default `max_tokens` to env.MAX_TOKENS_DEFAULT (4096) when the client
+  // omits it. Several upstream providers (notably OpenRouter) interpret
+  // `max_tokens: undefined` as "use the full model context window"
+  // (e.g. 131072 for llama-3.1-8b) which exceeds free-tier credit balances
+  // and triggers an HTTP 402. Capping at 4096 keeps free-tier requests
+  // within budget while remaining generous for typical chat use cases.
+  const defaultMaxTokens = parseInt(env.MAX_TOKENS_DEFAULT || '4096', 10);
   const gatewayReq = {
     model: body.model ?? 'auto',
     messages: body.messages,
     temperature: body.temperature,
-    max_tokens: body.max_tokens,
+    max_tokens: body.max_tokens ?? (isFinite(defaultMaxTokens) && defaultMaxTokens > 0 ? defaultMaxTokens : 4096),
     top_p: body.top_p,
     stream: body.stream === true,
     stop: body.stop,
@@ -465,7 +497,16 @@ async function handleChatCompletions(
 
   let gatewayResponse: Response;
   try {
-    gatewayResponse = await routeChat(gatewayReq, env, ctx);
+    // Dispatch to the streaming variant when the client asked for SSE.
+    // `routeChat` ignores `req.stream` and always returns a JSON response;
+    // `routeChatStream` forces `stream:true` and returns an SSE stream.
+    // Both share the same cascade / sticky-session / circuit-breaker code
+    // path internally (see gateway/model_router.ts `routeInternal`).
+    if (body.stream === true) {
+      gatewayResponse = await routeChatStream(gatewayReq, env, ctx);
+    } else {
+      gatewayResponse = await routeChat(gatewayReq, env, ctx);
+    }
   } catch (err) {
     // Defensive: routeChat should never throw (it returns an error Response
     // on any failure), but if it does we surface a 502 with the message.
@@ -565,6 +606,102 @@ async function handleDashboard(request: Request, env: Env): Promise<Response> {
     console.error('Dashboard query failed:', err);
     return json({ error: 'Dashboard query failed', message: String(err) }, 500);
   }
+}
+
+// ============ Provider List Handler (Task A1-retry — Agent C5 + C1) ============
+// GET /v1/providers — returns a lightweight list of all 11 cascade providers
+// with their id / label / configured / status (healthy|degraded|down) and
+// remaining quota. The richer per-provider snapshot comes from Agent A9's
+// `ProviderMonitor.getDashboardData(env)` — we call it once, then merge in
+// the registry's `isConfigured` flag so callers can tell "not set up"
+// providers apart from "configured but circuit-open" providers.
+//
+// Best-effort: D1 ledger failures degrade to status='unknown' for every
+// provider rather than erroring out. Useful as a lightweight health probe
+// (vs. /v1/dashboard which is the heavier ops view).
+async function handleProviderList(env: Env): Promise<Response> {
+  // Lazy import: avoids pulling the registry into the cold-start path for
+  // every non-/v1/providers request.
+  const { PROVIDERS, listProviders } = await import('./gateway/registry');
+  const ids = listProviders();
+
+  // Pull the dashboard data (best-effort: D1 failures degrade gracefully
+  // — ProviderMonitor.getDashboardData returns a row per provider with
+  // status='unknown' if D1 is unreachable).
+  let dashboardRows: Array<{
+    provider: string;
+    status: 'healthy' | 'degraded' | 'down' | 'unknown';
+    quota_remaining: { rpd: number; tpd: number };
+    calls_today: number;
+    success_rate: number;
+    circuit_open_until: number;
+  }> = [];
+  try {
+    const monitor = new ProviderMonitor(env);
+    const data = await monitor.getDashboardData(env);
+    dashboardRows = data.providers.map((p) => ({
+      provider: p.provider,
+      status: p.status,
+      quota_remaining: p.quota_remaining,
+      calls_today: p.calls_today,
+      success_rate: p.success_rate,
+      circuit_open_until: p.circuit_open_until,
+    }));
+  } catch (err) {
+    console.error('ProviderMonitor.getDashboardData failed:', err);
+  }
+  const dashboardByProvider = new Map(dashboardRows.map((r) => [r.provider, r]));
+
+  const providers = ids.map((id) => {
+    const adapter = PROVIDERS[id];
+    // Dashboard uses the 5-provider routing-layer granularity
+    // ('workers-ai', 'groq', 'mistral', 'openrouter', 'gemini'); the
+    // registry uses 11-provider per-key granularity ('groq1', 'groq2',
+    // 'workersai', …). Map our id to the dashboard's id so we can join.
+    const dashboardId = id === 'workersai' ? 'workers-ai'
+      : id === 'groq1' || id === 'groq2' ? 'groq'
+      : id;
+    const dashboard = dashboardByProvider.get(dashboardId);
+    const configured = adapter.isConfigured(env);
+    // Status precedence: unconfigured → 'down'; else use dashboard's view
+    // (which already accounts for circuit_open_until + consecutive_failures
+    // + is_healthy — see monitoring.ts `deriveStatus`); else 'unknown'.
+    const status: 'healthy' | 'degraded' | 'down' | 'unknown' = !configured
+      ? 'down'
+      : dashboard?.status ?? 'unknown';
+    // Backward-compat alias: clients that read the legacy `healthy` field
+    // expect only 'healthy' | 'down' | 'unknown'. Map 'degraded' to 'down'
+    // so the legacy contract is preserved (a degraded provider has had
+    // recent failures, so 'down' is the honest approximation).
+    const healthy: 'healthy' | 'down' | 'unknown' =
+      status === 'healthy' ? 'healthy'
+      : status === 'down' || status === 'degraded' ? 'down'
+      : 'unknown';
+    return {
+      id,
+      label: adapter.label,
+      configured,
+      status,
+      healthy,
+      quota_remaining: dashboard?.quota_remaining ?? { rpd: Number.POSITIVE_INFINITY, tpd: Number.POSITIVE_INFINITY },
+      calls_today: dashboard?.calls_today ?? 0,
+      success_rate: dashboard?.success_rate ?? 0,
+      circuit_open_until: dashboard?.circuit_open_until ?? 0,
+    };
+  });
+  const configuredCount = providers.filter((p) => p.configured).length;
+  const healthyCount = providers.filter((p) => p.status === 'healthy').length;
+  const degradedCount = providers.filter((p) => p.status === 'degraded').length;
+  const downCount = providers.filter((p) => p.status === 'down').length;
+  return json({
+    generated_at: Date.now(),
+    total: providers.length,
+    configured: configuredCount,
+    healthy: healthyCount,
+    degraded: degradedCount,
+    down: downCount,
+    providers,
+  });
 }
 
 // ============ Media Message Handler (video / voice / document / photo) ============
@@ -856,9 +993,10 @@ async function handleMediaMessage(
 
 // ============ Process Telegram Update ============
 async function processTelegramUpdate(update: TelegramUpdate, env: Env, ctx: ExecutionContext): Promise<void> {
-  // Task B11/B13: dispatch callback_query (inline keyboard) for the brand
-  // setup wizard and the storyboard approval flow. The storyboard handler
-  // acks the query itself; the brand handler is acked above.
+  // Task B11/B13/B15: dispatch callback_query (inline keyboard) for the
+  // brand setup wizard, the storyboard approval flow, and the multi-cam
+  // sync / switching-mode picker. Each branch acks the callback itself
+  // (or delegates to the matching handler that does so).
   if (update.callback_query) {
     const cq = update.callback_query;
     const chatId = cq.message?.chat?.id;
@@ -879,6 +1017,40 @@ async function processTelegramUpdate(update: TelegramUpdate, env: Env, ctx: Exec
       // Task B11: storyboard approval flow (approve / edit / regen / cancel).
       const { routeCallbackQuery } = await import('./bot/handlers');
       await routeCallbackQuery(env, ctx, cq as Parameters<typeof routeCallbackQuery>[2]);
+    } else if (chatId && data.startsWith('multicam:sync:')) {
+      // Task B15: multi-cam alignment-method choice
+      // (auto | clap_detection | manual | skip). Ack the callback so
+      // Telegram stops showing the loading spinner, then dispatch to
+      // handleMulticamSyncChoice which routes to the manual-offset
+      // prompt or the switch-mode picker.
+      try {
+        await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ callback_query_id: cq.id }),
+        });
+      } catch (err) {
+        console.warn('[callback] answerCallbackQuery failed:', err);
+      }
+      const method = data.slice('multicam:sync:'.length);
+      const { handleMulticamSyncChoice } = await import('./bot/handlers');
+      await handleMulticamSyncChoice(env, chatId, method);
+    } else if (chatId && data.startsWith('multicam:mode:')) {
+      // Task B15: multi-cam switching-mode choice
+      // (smart | round_robin | beat_sync | speaker). Enqueues the
+      // multi-cam montage task with the chosen sync + switching mode.
+      try {
+        await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ callback_query_id: cq.id }),
+        });
+      } catch (err) {
+        console.warn('[callback] answerCallbackQuery failed:', err);
+      }
+      const switchMode = data.slice('multicam:mode:'.length);
+      const { handleMulticamSwitchModeChoice } = await import('./bot/handlers');
+      await handleMulticamSwitchModeChoice(env, chatId, switchMode);
     }
     return;
   }
@@ -1198,7 +1370,8 @@ async function processTelegramUpdate(update: TelegramUpdate, env: Env, ctx: Exec
   if (text && !text.startsWith('/')) {
     const { hasActiveWizard, handleNewProjectWizardStep,
             hasActiveStoryboardEdit, getActiveStoryboardEdit,
-            handleStoryboardEdit } = await import('./bot/handlers');
+            handleStoryboardEdit,
+            handleMulticamManualOffsetText } = await import('./bot/handlers');
     if (await hasActiveWizard(env, chatId)) {
       await handleNewProjectWizardStep(env, chatId, text);
       return;
@@ -1212,6 +1385,12 @@ async function processTelegramUpdate(update: TelegramUpdate, env: Env, ctx: Exec
         return;
       }
     }
+    // Task B15: multi-cam manual-offset wizard — free-text message
+    // "cam1:+2.5 cam2:-1.0" becomes the per-camera offset list (only
+    // consulted when the user just picked `multicam:sync:manual`).
+    // Returns true if consumed; false otherwise (fall through to text mode).
+    const consumedMulticam = await handleMulticamManualOffsetText(env, chatId, text);
+    if (consumedMulticam) return;
 
     // ============ Text Mode: Full AI Response with Prompt Compiler ============
     try {

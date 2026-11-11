@@ -51,6 +51,7 @@ import { CohereAdapter } from './adapters/cohere';
 import { SiliconFlowAdapter } from './adapters/siliconflow';
 import { CerebrasAdapter } from './adapters/cerebras';
 import { NovitaAdapter } from './adapters/novita';
+import { GizmoAdapter } from './adapters/gizmo';
 
 import { QuotaLedger } from './ledger/ledger';
 import type { DeltaChunk } from './adapters/types';
@@ -437,6 +438,10 @@ const HANDLES: Record<ProviderId, ProviderAdapter> = {
     'novita', 'Novita AI', 'NOVITA_KEY',
     NovitaAdapter as unknown as BaseCompatCtor,
   ),
+  gizmo: new BaseCompatHandle(
+    'gizmo', 'Gizmo Platform (free models)', 'GIZMO_KEY',
+    GizmoAdapter as unknown as BaseCompatCtor,
+  ),
 };
 
 // ============================================================================
@@ -493,5 +498,5 @@ export {
   groq1Adapter, groq2Adapter, GroqAdapter, geminiAdapter, GeminiAdapter,
   mistralAdapter, MistralAdapter, workersaiAdapter, WorkersAIAdapter,
   OpenRouterAdapter, SambaNovaAdapter, CohereAdapter,
-  SiliconFlowAdapter, CerebrasAdapter, NovitaAdapter,
+  SiliconFlowAdapter, CerebrasAdapter, NovitaAdapter, GizmoAdapter,
 };

@@ -51,6 +51,7 @@ export type ProviderId =
   | 'cohere'
   | 'gemini'
   | 'novita'
+  | 'gizmo'
   | 'openrouter';
 
 /** Runtime guard for {@link ProviderId}. */
@@ -66,6 +67,7 @@ export function isProviderId(value: string): value is ProviderId {
     value === 'cohere' ||
     value === 'gemini' ||
     value === 'novita' ||
+    value === 'gizmo' ||
     value === 'openrouter'
   );
 }
@@ -82,6 +84,7 @@ export const PROVIDER_LABELS: Readonly<Record<ProviderId, string>> = Object.free
   cohere: 'Cohere',
   gemini: 'Google Gemini',
   novita: 'Novita AI',
+  gizmo: 'Gizmo Platform (free models)',
   openrouter: 'OpenRouter',
 });
 

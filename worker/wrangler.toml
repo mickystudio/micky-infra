@@ -65,6 +65,8 @@ MAX_TOKENS_DEFAULT = "4096"
 TEMPERATURE_DEFAULT = "0.4"
 
 # Secrets (set via `wrangler secret put`):
+#
+# Core (required):
 # - TELEGRAM_BOT_TOKEN
 # - TELEGRAM_CHAT_ID_WHITELIST (comma-separated)
 # - MICKY_PASSWORD_HASH (bcrypt)
@@ -72,11 +74,37 @@ TEMPERATURE_DEFAULT = "0.4"
 # - GH_WEBHOOK_SECRET
 # - KAGGLE_API_TOKEN
 #
-# Gateway (Agent A9 — health-check probes need these to validate provider keys):
-# - GROQ_API_KEY         (Groq Cloud free tier)
-# - MISTRAL_API_KEY      (Mistral La Plateforme)
-# - OPENROUTER_API_KEY   (OpenRouter free models)
-# - GEMINI_API_KEY       (Google AI Studio — Gemini Flash)
+# ============ Multi-provider LLM Gateway (Task A1-retry) ============
+# 10 provider API keys. Each is REQUIRED by the gateway's `ProviderKeys`
+# interface; at runtime a missing/empty key is treated as "provider
+# unconfigured" and the provider is skipped in the cascade (see
+# `gateway/registry.ts` `isProviderConfigured`).
+# - GROQ_KEY_1           (Groq Cloud free tier — account 1)
+# - GROQ_KEY_2           (Groq Cloud free tier — account 2; load-shedding)
+# - GEMINI_KEY           (Google AI Studio — Gemini Flash)
+# - MISTRAL_KEY           (Mistral La Plateforme)
+# - OPENROUTER_KEY        (OpenRouter free models)
+# - SAMBANOVA_KEY         (SambaNova Cloud)
+# - COHERE_KEY            (Cohere Command R)
+# - SILICONFLOW_KEY       (SiliconFlow aggregator)
+# - CEREBRAS_KEY          (Cerebras Cloud — Llama 3.1 8B/70B)
+# - NOVITA_KEY            (Novita AI — DeepSeek / Llama / Mistral)
+#
+# ============ Optional integration secrets ============
+# Audio library (Task B16 — background-music selection in montage pipeline):
+# - JAMENDO_CLIENT_ID     (Jamendo API — free CC-licensed music)
+# - FREESOUND_TOKEN       (Freesound API — SFX library)
+#
+# Compute runners (Task B9 — ZeroGPU + serverless GPU):
+# - HF_TOKEN              (HuggingFace access token for ZeroGPU spaces)
+# - HF_SPACE_ID           (HF Space that hosts the ZeroGPU montage runner)
+# - MODAL_TOKEN_ID        (Modal serverless GPU — token id)
+# - MODAL_TOKEN_SECRET    (Modal serverless GPU — token secret)
+# - MODAL_APP_NAME        (Modal app/workspace name)
+#
+# Cloudflare account-level (Media Transform + R2 storage of rendered videos):
+# - CF_ACCOUNT_ID         (Cloudflare account id — for Media Transform API)
+# - CF_API_TOKEN          (Cloudflare API token with Media:Edit + Workers:AI perms)
 #
 # Optional KV namespace for alert rate-limiting (falls back to RATE_LIMITS
 # when not bound — see gateway/alerts.ts pickAlertKv()):

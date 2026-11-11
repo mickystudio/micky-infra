@@ -144,6 +144,10 @@ export class GeminiApiError extends Error {
 const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';
 const GEMINI_MODELS_PATH = '/models';
 const SUPPORTED_MODELS: readonly string[] = [
+  'gemini-3.8-flash',
+  'gemini-3.8-flash-lite',
+  'gemini-3.8-flash',
+  'gemini-3.8-flash-lite',
   'gemini-2.0-flash',
   'gemini-2.0-flash-lite',
   'gemini-1.5-flash',

@@ -188,7 +188,12 @@ async function tryProvider(
 
   try {
     if (isStream) {
-      const stream = await withTimeout(adapter.chatStream(modifiedReq, env), CHAT_TIMEOUT_MS);
+      const rawStream = await withTimeout(adapter.chatStream(modifiedReq, env), CHAT_TIMEOUT_MS);
+      // Peek the first chunk BEFORE committing: deferred provider errors
+      // (region blocks, dead keys, bad models) surface on the first read.
+      // A throw here lands in the catch below → cascade tries the next
+      // provider instead of streaming an error to the user.
+      const stream = await peekFirstChunk(rawStream, CHAT_TIMEOUT_MS);
       if (ledger) {
         ctx.waitUntil(recordSuccess(
           ledger, provider, model, intent, conversationId,
@@ -429,6 +434,53 @@ function wrapStreamWithErrorHandler(stream: ReadableStream<Uint8Array>): Readabl
     },
     cancel() {
       try { reader.releaseLock(); } catch { /* noop */ }
+    },
+  });
+}
+
+/**
+ * Peek the FIRST chunk of an upstream stream before committing to it.
+ *
+ * Why: many providers (Gemini included) accept the HTTP request (200 + SSE
+ * headers) and only surface the real error (400 region-block, 404 bad model,
+ * 429 quota…) on the first stream read. Without a peek the router commits to
+ * the stream and the user sees `data: {"error":…}` with NO fallback.
+ *
+ * Behaviour:
+ *   • If the first read THROWS (provider surfaced a deferred error) → rethrow
+ *     so `tryProvider`'s catch marks the failure and the cascade continues
+ *     with the next provider.
+ *   • Otherwise → return a replay stream that yields the peeked chunk first,
+ *     then continues piping the upstream reader.
+ */
+async function peekFirstChunk(
+  stream: ReadableStream<Uint8Array>,
+  timeoutMs: number,
+): Promise<ReadableStream<Uint8Array>> {
+  const reader = stream.getReader();
+  let first: Uint8Array;
+  try {
+    const r = await withTimeout(reader.read(), timeoutMs);
+    first = r.done ? new Uint8Array(0) : (r.value ?? new Uint8Array(0));
+  } catch (err) {
+    try { reader.cancel(); } catch { /* noop */ }
+    throw err; // → tryProvider catch → cascade fallback
+  }
+  // Replay stream: yields the peeked chunk exactly once, then pipes the rest.
+  let replayed = false;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (!replayed) {
+        replayed = true;
+        if (first.length > 0) controller.enqueue(first);
+        return;
+      }
+      const { done, value } = await reader.read();
+      if (done) { controller.close(); return; }
+      if (value) controller.enqueue(value);
+    },
+    cancel() {
+      try { reader.cancel(); } catch { /* noop */ }
     },
   });
 }

@@ -235,6 +235,7 @@ export function estimateOutputTokens(
  * Update this table when providers change their free-tier limits.
  */
 export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
+  gizmo: 32768,
   // ── Groq (groq1 + groq2) ──────────────────────────────────────────────
   'llama-3.1-8b-instant': 131072,
   'llama-3.1-8b': 131072, // alias
@@ -284,7 +285,7 @@ export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
   // ── Gemini (Google AI Studio free tier) ──────────────────────────────
   'gemini-1.5-flash': 1048576,
   'gemini-2.0-flash': 1048576,
-  'gemini-2.5-flash': 1048576,
+  'gemini-3.8-flash': 1048576,
   'gemini-flash': 1048576, // alias used by intent_classifier
   'gemini-1.5-pro': 2097152,
   // ── Novita (free tier) ───────────────────────────────────────────────
@@ -299,6 +300,10 @@ export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
   'qwen/qwen-2.5-72b-instruct:free': 32768,
   'deepseek/deepseek-r1:free': 64000,
   'google/gemini-2.0-flash-exp:free': 1048576,
+  // ── Gizmo (free models) ─────────────────────────────────────────────
+  'liquid/lfm-3-1.7b:free': 32768,
+  'nvidia/nemotron-3.5-lightning:free': 128000,
+  'nvidia/nemotron-3-ultra-550b-a55b:free': 128000,
 };
 
 /** Per-provider default context window (used when model is unknown). */
@@ -313,6 +318,7 @@ const PROVIDER_DEFAULT_LIMITS: Record<ProviderId, number> = {
   cohere: 128000,
   gemini: 1048576,
   novita: 32000,
+  gizmo: 32768,
   openrouter: 32768,
 };
 

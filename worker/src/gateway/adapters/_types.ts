@@ -27,11 +27,13 @@
 
 export type ProviderId =
   | 'sambanova' | 'cohere' | 'siliconflow' | 'cerebras' | 'novita'
+  | 'gizmo'
   | 'openrouter' | 'workersai';
 
 export function isProviderId(value: string): value is ProviderId {
   return value === 'sambanova' || value === 'cohere' || value === 'siliconflow'
     || value === 'cerebras' || value === 'novita'
+    || value === 'gizmo'
     || value === 'openrouter' || value === 'workersai';
 }
 
